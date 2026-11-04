@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# build_windows.bat (PyInstaller)
+build/
+dist/
+*.spec
+telsiz.ico
+
+# left behind only if an update was interrupted
+.telsiz-update/
+.telsiz-backup/
+*.old.exe
+*.exe.download
+
+# operating systems
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,7 @@
+# Line endings: Windows batch files want CRLF, shell scripts must keep LF (they run on Linux servers).
+* text=auto
+*.bat text eol=crlf
+*.sh text eol=lf
+*.png binary
+*.ico binary
+*.woff2 binary

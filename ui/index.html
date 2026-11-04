@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telsiz</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="top">
+      <svg class="isolines" aria-hidden="true" viewBox="0 0 400 200" preserveAspectRatio="xMidYMid slice"></svg>
+      <div class="top-row">
+        <h1 class="title">Telsiz<small id="status">Starting…</small></h1>
+        <div class="top-actions">
+          <button class="icon-btn" id="btn-audio" title="Audio settings" aria-label="Audio settings"></button>
+          <button class="icon-btn" id="btn-hide" title="Hide to the tray (Telsiz keeps running)" aria-label="Hide to the tray" hidden></button>
+        </div>
+      </div>
+      <div class="meter" id="meter" role="slider" aria-label="Microphone level. Drag to set the sensitivity." tabindex="0">
+        <div class="cells" id="cells"></div>
+        <div class="thr" id="thr"><i></i></div>
+      </div>
+      <div class="bar-legend">
+        <span id="air"></span>
+        <span id="sens"></span>
+      </div>
+    </header>
+
+    <div id="notices" class="inbox" aria-live="polite"></div>
+
+    <main class="view" id="main">
+      <section class="spotlight"><div class="spot" id="room"></div></section>
+      <section id="people" class="list"></section>
+      <section id="tools" class="tools"></section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+    <nav class="dock" aria-label="Your microphone and sound">
+      <button class="dock-btn" id="btn-mute"></button>
+      <button class="dock-btn" id="btn-deaf"></button>
+      <button class="dock-btn" id="btn-audio2"></button>
+    </nav>
+
+    <aside id="audio" class="settings" hidden aria-label="Audio settings"></aside>
+    <aside id="bans" class="settings" hidden aria-label="Bans"></aside>
+    <div id="modal" class="modal" hidden></div>
+  </div>
+  <canvas id="fx" aria-hidden="true"></canvas>
+
+  <script src="fx.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

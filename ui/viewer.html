@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob:; connect-src 'self'">
+  <title>Screen</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    html, body { background: #000; }
+    #screen { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+    #wait {
+      position: fixed; inset: 0; display: grid; place-items: center; text-align: center;
+      color: var(--mute); font-size: 14px; padding: 24px;
+    }
+    #wait b { display: block; color: var(--text); font-family: var(--display); font-stretch: 88%; font-size: 22px; margin-bottom: 6px; }
+    #hint {
+      position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+      padding: 8px 14px; border-radius: 10px; background: rgba(21, 34, 61, .88); color: var(--mute);
+      font-size: 12.5px; transition: opacity .6s; pointer-events: none; white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="screen"></canvas>
+  <div id="wait"><div><b id="who">Waiting for the screen</b><span id="sub">The first picture arrives in a moment.</span></div></div>
+  <div id="hint">Double-click for full screen. Esc leaves it.</div>
+  <script src="viewer.js"></script>
+</body>
+</html>
