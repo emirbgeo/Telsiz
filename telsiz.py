@@ -44,19 +44,20 @@ import numpy as np
 
 
 APP_NAME = "Telsiz"
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 PROTOCOL = 2
 DEFAULT_PORT = 50505
 
 SR = 48000            # sample rate
 FRAME = 960           # 20 ms at 48 kHz
-BITRATE = 32000       # Opus voice bitrate (bits per second)
+BITRATE = 48000       # Opus voice bitrate (bits per second); with error correction on, about 39 kbit/s actually used
 MAX_CLIENTS = 15
 MAX_NAME = 32
 PREBUFFER = 2         # starting jitter buffer: 2 frames (40 ms)
 MAX_TARGET = 6        # jitter buffer never aims above 6 frames (120 ms)
 TRIM_SLACK = 4        # backlog this far above target gets cut (caps latency)
 HANG_FRAMES = 15      # voice gate stays open 300 ms after speech drops
+OUT_LATENCY_SAFE = 0.06  # headphone buffer after repeated dropouts (measured: about a third of the dropouts of the minimum)
 PING_EVERY = 1.0
 ROSTER_EVERY = 2.0
 TIMEOUT = 6.0
@@ -145,6 +146,17 @@ def parse_address(text: str, default_port: int = DEFAULT_PORT):
     return host.strip(), port
 
 
+def _roomy(sock):
+    """Bigger socket buffers: Windows gives UDP sockets small ones, and a burst of screen sharing
+    packets could push voice packets out while Telsiz is busy for a moment."""
+    for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, 1 << 20)
+        except OSError:
+            pass
+    return sock
+
+
 def friendly_error(e: Exception) -> str:
     if isinstance(e, socket.gaierror):
         return "Could not find that host. Check the address."
@@ -157,10 +169,95 @@ def friendly_error(e: Exception) -> str:
 
 
 # --------------------------------------------------------------------------
-# Opus codec (through PyAV, which ships libopus inside its wheels)
+# Opus codec
+#
+# Telsiz calls libopus directly: the copy inside PyAV's wheels (av.libs), or a
+# system copy. That gives it what PyAV can't reach: Opus's own concealment of
+# lost packets, and in-band forward error correction (each packet also carries
+# a coarse copy of the one before, so a single lost packet can be rebuilt from
+# the next). If no usable libopus is found, Telsiz encodes and decodes through
+# PyAV as 1.6 did. Both kinds of Telsiz understand each other's packets.
 # --------------------------------------------------------------------------
+OPUS_APPLICATION_VOIP = 2048
+OPUS_SIGNAL_VOICE = 3001
+OPUS_SET_BITRATE, OPUS_SET_VBR, OPUS_SET_COMPLEXITY = 4002, 4006, 4010
+OPUS_SET_INBAND_FEC, OPUS_SET_PACKET_LOSS_PERC, OPUS_SET_SIGNAL = 4012, 4014, 4024
+OPUS_FEC_LOSS_PERC = 10      # how much loss the encoder protects against (measured: costs almost nothing when clean)
+OPUS_MAX_PACKET = 1275
+OPUS_MAX_SAMPLES = 5760      # 120 ms, the longest an Opus packet can be
+
+_opus = None                 # the loaded library, False when none could be loaded
+
+
+def _opus_candidates():
+    import ctypes.util
+    found = []
+    try:
+        import av
+        base = Path(av.__file__).resolve().parent
+        for d in (base.parent / "av.libs", base / ".dylibs", base.parent / "av.dylibs", base):
+            if d.is_dir():
+                found += sorted(p for p in d.iterdir() if "opus" in p.name.lower())
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):  # Telsiz.exe: wherever PyInstaller put the DLL
+        root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        found += sorted(p for p in root.rglob("*opus*") if p.suffix.lower() in (".dll", ".so", ".dylib")
+                        or ".so." in p.name)
+    name = ctypes.util.find_library("opus")
+    if name:
+        found.append(name)
+    return found
+
+
+def opus_library():
+    """libopus through ctypes, or None (then PyAV is used). Loaded once."""
+    global _opus
+    if _opus is None:
+        _opus = False
+        if os.environ.get("TELSIZ_OPUS") == "pyav":  # tests and troubleshooting: force the old path
+            return None
+        import ctypes
+        from ctypes import POINTER, c_float, c_int, c_ubyte, c_void_p
+        for cand in _opus_candidates():
+            try:
+                lib = ctypes.CDLL(str(cand))
+                lib.opus_encoder_create.restype = c_void_p
+                lib.opus_encoder_create.argtypes = [c_int, c_int, c_int, POINTER(c_int)]
+                lib.opus_decoder_create.restype = c_void_p
+                lib.opus_decoder_create.argtypes = [c_int, c_int, POINTER(c_int)]
+                lib.opus_encode_float.restype = c_int
+                lib.opus_encode_float.argtypes = [c_void_p, POINTER(c_float), c_int, POINTER(c_ubyte), c_int]
+                lib.opus_decode_float.restype = c_int
+                lib.opus_decode_float.argtypes = [c_void_p, POINTER(c_ubyte), c_int, POINTER(c_float), c_int, c_int]
+                lib.opus_encoder_ctl.restype = c_int
+                lib.opus_encoder_destroy.argtypes = [c_void_p]
+                lib.opus_decoder_destroy.argtypes = [c_void_p]
+                lib.opus_get_version_string.restype = ctypes.c_char_p
+                lib.version = lib.opus_get_version_string().decode("ascii", "replace")
+                _opus = lib
+                break
+            except (OSError, AttributeError):
+                continue
+    return _opus or None
+
+
 class OpusEncoder:
     def __init__(self, bitrate: int = BITRATE):
+        self.lib = opus_library()
+        if self.lib is not None:
+            import ctypes
+            err = ctypes.c_int(0)
+            self._enc = self.lib.opus_encoder_create(SR, 1, OPUS_APPLICATION_VOIP, ctypes.byref(err))
+            if not self._enc or err.value != 0:
+                raise RuntimeError(f"Opus encoder failed ({err.value})")
+            for req, val in ((OPUS_SET_BITRATE, bitrate), (OPUS_SET_VBR, 1), (OPUS_SET_COMPLEXITY, 10),
+                             (OPUS_SET_INBAND_FEC, 1), (OPUS_SET_PACKET_LOSS_PERC, OPUS_FEC_LOSS_PERC),
+                             (OPUS_SET_SIGNAL, OPUS_SIGNAL_VOICE)):
+                self.lib.opus_encoder_ctl(ctypes.c_void_p(self._enc), ctypes.c_int(req), ctypes.c_int(val))
+            self._out = (ctypes.c_ubyte * OPUS_MAX_PACKET)()
+            self._fptr = ctypes.POINTER(ctypes.c_float)
+            return
         import av
         self._av = av
         ctx = av.CodecContext.create("libopus", "w")
@@ -168,12 +265,17 @@ class OpusEncoder:
         ctx.layout = "mono"
         ctx.format = "s16"
         ctx.bit_rate = bitrate
-        ctx.options = {"application": "voip", "frame_duration": "20", "vbr": "on"}
+        ctx.options = {"application": "voip", "frame_duration": "20", "vbr": "on",
+                       "fec": "1", "packet_loss": str(OPUS_FEC_LOSS_PERC)}
         ctx.open()
         self.ctx = ctx
         self.pts = 0
 
     def encode(self, pcm: np.ndarray) -> list[bytes]:
+        if self.lib is not None:
+            x = np.ascontiguousarray(pcm, dtype=np.float32)
+            n = self.lib.opus_encode_float(self._enc, x.ctypes.data_as(self._fptr), len(x), self._out, OPUS_MAX_PACKET)
+            return [bytes(self._out[:n])] if n > 0 else []
         s16 = np.clip(pcm * 32767.0, -32768, 32767).astype(np.int16).reshape(1, -1)
         frame = self._av.AudioFrame.from_ndarray(s16, format="s16", layout="mono")
         frame.sample_rate = SR
@@ -181,9 +283,32 @@ class OpusEncoder:
         self.pts += s16.shape[1]
         return [bytes(p) for p in self.ctx.encode(frame)]
 
+    def __del__(self):
+        enc = getattr(self, "_enc", None)
+        if enc:
+            try:
+                self.lib.opus_encoder_destroy(enc)
+            except Exception:
+                pass
+
 
 class OpusDecoder:
+    """decode() for packets that arrived; conceal() and recover() for ones that didn't
+    (both only with libopus: `native` says whether they work)."""
+
     def __init__(self):
+        self.lib = opus_library()
+        self.native = self.lib is not None
+        if self.native:
+            import ctypes
+            err = ctypes.c_int(0)
+            self._dec = self.lib.opus_decoder_create(SR, 1, ctypes.byref(err))
+            if not self._dec or err.value != 0:
+                raise RuntimeError(f"Opus decoder failed ({err.value})")
+            self._pcm = np.zeros(OPUS_MAX_SAMPLES, np.float32)
+            self._pptr = self._pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            self._ubytes = ctypes.c_ubyte
+            return
         import av
         self._av = av
         ctx = av.CodecContext.create("opus", "r")
@@ -191,7 +316,18 @@ class OpusDecoder:
         ctx.layout = "mono"
         self.ctx = ctx
 
+    def _run(self, payload, n, fec):
+        if payload is None:
+            got = self.lib.opus_decode_float(self._dec, None, 0, self._pptr, n, 0)
+        else:
+            buf = (self._ubytes * len(payload)).from_buffer_copy(payload)
+            got = self.lib.opus_decode_float(self._dec, buf, len(payload), self._pptr, n, fec)
+        return self._pcm[:got].copy() if got > 0 else None
+
     def decode(self, payload: bytes) -> list[np.ndarray]:
+        if self.native:
+            pcm = self._run(payload, OPUS_MAX_SAMPLES, 0)
+            return [pcm] if pcm is not None else []
         out = []
         for frame in self.ctx.decode(self._av.Packet(payload)):
             a = frame.to_ndarray()
@@ -199,6 +335,138 @@ class OpusDecoder:
             if a.dtype == np.int16:
                 a = a.astype(np.float32) / 32768.0
             out.append(np.ascontiguousarray(a, dtype=np.float32))
+        return out
+
+    def conceal(self, n: int = FRAME):
+        """Opus's own guess for a missing frame (fades out by itself when gaps go on)."""
+        return self._run(None, n, 0) if self.native else None
+
+    def recover(self, next_payload: bytes, n: int = FRAME):
+        """Rebuild a missing frame from the error correction data in the packet after it."""
+        return self._run(next_payload, n, 1) if self.native else None
+
+    def __del__(self):
+        dec = getattr(self, "_dec", None)
+        if dec:
+            try:
+                self.lib.opus_decoder_destroy(dec)
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------
+# Level control: a peak limiter instead of clipping, and fades
+# --------------------------------------------------------------------------
+FADE_IN = 240                                                     # 5 ms
+RAMP_UP = (0.5 - 0.5 * np.cos(np.pi * np.arange(FADE_IN) / FADE_IN)).astype(np.float32)
+RAMP_DOWN = (0.5 + 0.5 * np.cos(np.pi * np.arange(FRAME) / FRAME)).astype(np.float32)  # over a whole frame
+
+
+class Limiter:
+    """Keeps peaks under `ceiling` without chopping off the tops of the waveform (which is what crackles):
+    the gain goes down within 1 ms, early enough because the signal is delayed by 1 ms, and comes back
+    up over `release` seconds."""
+
+    BLOCK = 48  # 1 ms
+
+    def __init__(self, ceiling: float = 0.89, release: float = 0.15):
+        self.ceiling = ceiling
+        self.rel = math.exp(-self.BLOCK / (release * SR))
+        self.gain = 1.0
+        self.tail = np.zeros(self.BLOCK, np.float32)  # last millisecond of the previous call
+        self.tail_need = 1.0
+
+    def process(self, x: np.ndarray) -> np.ndarray:
+        B = self.BLOCK
+        if len(x) % B or len(x) < B:  # never happens with 20 ms blocks; stay safe anyway
+            return np.clip(x, -self.ceiling, self.ceiling)
+        need = np.minimum(1.0, self.ceiling / np.maximum(np.abs(x.reshape(-1, B)).max(axis=1), 1e-9))
+        need_out = np.concatenate(([self.tail_need], need[:-1]))  # what each delayed output block needs
+        ends = np.empty(len(need))
+        g = self.gain
+        for i in range(len(need)):
+            g = min(need_out[i], need[i], 1.0 - (1.0 - g) * self.rel)
+            ends[i] = g
+        starts = np.concatenate(([self.gain], ends[:-1]))
+        ramp = starts[:, None] + (ends - starts)[:, None] * (np.arange(1, B + 1, dtype=np.float64) / B)[None, :]
+        out = (np.concatenate((self.tail, x[:-B])).reshape(-1, B) * ramp).reshape(-1).astype(np.float32)
+        self.gain, self.tail, self.tail_need = g, x[-B:].astype(np.float32), float(need[-1])
+        return out
+
+
+class NoiseReducer:
+    """Turns down steady background noise (fans, hum, hiss) in the microphone signal.
+
+    Each 20 ms frame is cut into 20 ms windows every 10 ms (sqrt Hann, so the
+    windows add back up exactly). The noise in each frequency band is learned
+    once the voice gate has been shut for 300 ms, so it is the room and not your
+    voice. Until then, or if the gate never shuts (sensitivity set below the
+    room's noise), it is the lowest level each band reached in the last 1.5
+    seconds ("minimum statistics"). Each band is then turned down by how much of
+    it is noise (a Wiener gain with "decision directed" smoothing), but never by
+    more than `floor_db`, so voices keep their natural sound. Adds 10 ms of
+    delay. Sudden noises such as key clicks are not steady and stay.
+    These choices were measured with PESQ against the alternatives.
+    """
+
+    N, H = FRAME, FRAME // 2
+    SPAN = 30            # hops per sub window (0.3 s); 5 of them make the 1.5 s memory
+
+    def __init__(self, floor_db: float = -15.0):
+        n = np.arange(self.N)
+        self.win = np.sqrt(0.5 - 0.5 * np.cos(2 * np.pi * n / self.N)).astype(np.float32)
+        self.floor = 10 ** (floor_db / 20)
+        bins = self.N // 2 + 1
+        self.low = np.fft.rfftfreq(self.N, 1 / SR) < 70.0  # below a voice's lowest notes: hum, rumble
+        self.smooth = None
+        self.cur_min = None
+        self.mins = collections.deque(maxlen=5)
+        self.learned = None                                # the room's noise, learned while the gate was shut
+        self.shut = 0                                      # frames the gate has been shut
+        self.hops = 0
+        self.prev_gain = np.ones(bins)
+        self.prev_power = np.zeros(bins)
+        self.inbuf = np.zeros(self.N, np.float32)          # the last 20 ms of input
+        self.outbuf = np.zeros(self.N, np.float32)         # overlap-add accumulator
+
+    def process(self, x: np.ndarray, gate_open: bool) -> np.ndarray:
+        out = np.empty(len(x), np.float32)
+        self.shut = 0 if gate_open else self.shut + 1
+        for i in range(0, len(x), self.H):
+            self.inbuf = np.concatenate((self.inbuf[self.H:], x[i:i + self.H]))
+            spec = np.fft.rfft(self.inbuf * self.win)
+            power = spec.real ** 2 + spec.imag ** 2
+            if self.smooth is None:
+                self.smooth = power.copy()
+                self.cur_min = power.copy()
+            self.smooth = 0.85 * self.smooth + 0.15 * power
+            self.cur_min = np.minimum(self.cur_min, self.smooth)
+            self.hops += 1
+            if self.hops % self.SPAN == 0:
+                self.mins.append(self.cur_min)
+                self.cur_min = self.smooth.copy()
+            if self.shut >= HANG_FRAMES:                  # shut for 300 ms: what we hear now is the room
+                self.learned = power.copy() if self.learned is None else 0.9 * self.learned + 0.1 * power
+            if self.learned is not None:
+                noise = self.learned
+            else:
+                noise = self.cur_min
+                for m in self.mins:
+                    noise = np.minimum(noise, m)
+            noise = np.maximum(noise, 1e-12)
+            snr_post = power / noise
+            snr_prio = 0.98 * (self.prev_gain ** 2) * self.prev_power / noise + 0.02 * np.maximum(snr_post - 1.0, 0.0)
+            gain = snr_prio / (1.0 + snr_prio)
+            gain = np.convolve(gain, (0.25, 0.5, 0.25), "same")              # smooth across bands: less "musical" noise
+            gain = np.maximum(gain, self.floor)
+            gain[self.low] = np.minimum(gain[self.low], self.floor)
+            if self.hops < 60:                                               # first 0.6 s: still listening
+                gain = np.ones_like(gain)
+            self.prev_gain, self.prev_power = gain, power
+            y = np.fft.irfft(spec * gain, self.N).astype(np.float32) * self.win
+            self.outbuf += y
+            out[i:i + self.H] = self.outbuf[:self.H]
+            self.outbuf = np.concatenate((self.outbuf[self.H:], np.zeros(self.H, np.float32)))
         return out
 
 
@@ -304,10 +572,14 @@ class RemoteVoice:
     """One speaker's jitter buffer.
 
     Opus packets are stored by sequence number and decoded in order at playout
-    time, so packets that arrive out of order are put back in order. A frame
-    that is still missing when its turn comes is concealed (faded repeat of
-    the previous frame). Playback starts once `target` packets are queued; the
-    target grows after real underruns and shrinks again on a calm network.
+    time, so packets that arrive out of order are put back in order. A packet
+    that is still missing when its turn comes is rebuilt from the error
+    correction data in the next packet if that one is here, or else replaced by
+    Opus's own guess. (Filling in with guesses when nothing at all is queued was
+    measured too: it scored worse than waiting for the buffer to refill.)
+    Playback starts once `target` packets are queued; the target grows after
+    underruns and shrinks again on a calm network. Without libopus, a missing
+    frame is a faded repeat of the previous one, as in 1.6.
     """
 
     def __init__(self, clock=time.monotonic):
@@ -326,7 +598,8 @@ class RemoteVoice:
         self._carry = np.zeros(0, np.float32)
         self._dry_at = None
         self._changed_at = clock()
-        self.stats = {"late": 0, "concealed": 0, "underruns": 0}
+        self._fade_in = False
+        self.stats = {"played": 0, "late": 0, "recovered": 0, "concealed": 0, "underruns": 0}
 
     def _oldest(self) -> int:
         ref = self._newest
@@ -350,7 +623,7 @@ class RemoteVoice:
                 if now - self._dry_at < 0.08:
                     self.stats["underruns"] += 1
                     if self.target < MAX_TARGET:
-                        self.target += 1  # stream continued right after running dry
+                        self.target += 1  # the stream went on right after running dry: buffer a bit more
                         self._changed_at = now
                 self._dry_at = None
             elif self.target > PREBUFFER and now - self._changed_at > 15.0:
@@ -388,34 +661,48 @@ class RemoteVoice:
                 self.playing = True
                 self.next_seq = self._oldest()
                 self._miss = 0
+                self._fade_in = True
             else:
                 return None
-        if not self.packets:  # end of a sentence, or an underrun
+        dec = self.decoder
+        if not self.packets:  # nothing queued: the sentence ended, or the next packet is late
             self.playing = False
             self._dry_at = self.clock()
             self._last_pcm = None
             return None
         payload = self.packets.pop(self.next_seq, None)
-        if payload is None:
+        if payload is None:  # lost, or so late that later packets are already here
             self._miss += 1
-            if self._miss <= 3:  # conceal a short hole, later packets are waiting
-                self.stats["concealed"] += 1
+            if self._miss <= 3:
+                nxt = self.packets.get((self.next_seq + 1) & 0xFFFF)
+                pcm = None
+                if dec.native:
+                    pcm = dec.recover(nxt) if nxt is not None else dec.conceal()
+                    if pcm is not None:
+                        self.stats["recovered" if nxt is not None else "concealed"] += 1
+                if pcm is None:  # without libopus: a faded repeat of the previous frame
+                    self.stats["concealed"] += 1
+                    pcm = np.zeros(FRAME, np.float32) if self._last_pcm is None else self._last_pcm * 0.5
                 self._last_played = self.next_seq
                 self.next_seq = (self.next_seq + 1) & 0xFFFF
-                if self._last_pcm is None:
-                    return np.zeros(FRAME, np.float32)
-                self._last_pcm = self._last_pcm * 0.5
-                return self._last_pcm
+                self._last_pcm = pcm
+                return pcm
             self.next_seq = self._oldest()  # long hole: jump to what we have
             payload = self.packets.pop(self.next_seq)
         self._miss = 0
         self._last_played = self.next_seq
         self.next_seq = (self.next_seq + 1) & 0xFFFF
         try:
-            frames = self.decoder.decode(payload)
+            frames = dec.decode(payload)
         except Exception:
             frames = []
         pcm = np.concatenate(frames) if frames else np.zeros(FRAME, np.float32)
+        if self._fade_in:  # first frame after silence: no click if the sender didn't fade in (1.6)
+            self._fade_in = False
+            if len(pcm) >= FADE_IN:
+                pcm = pcm.copy()
+                pcm[:FADE_IN] *= RAMP_UP
+        self.stats["played"] += 1
         self._last_pcm = pcm
         return pcm
 
@@ -536,6 +823,16 @@ class AudioEngine:
         self.mic_error = ""
         self.out_error = ""
         self._hang = 0
+        self._sending = False         # the last frame went out (a fade-out frame still follows)
+        self.denoise = True           # noise reduction on what we send
+        self.nr = NoiseReducer()
+        self._nr_hang = 0
+        self.tx_limiter = Limiter()
+        self.out_limiter = Limiter()
+        self.glitches = {"mic": 0, "out": 0}   # sound card buffers that ran over or dry
+        self.out_latency = "low"      # the smallest buffer the sound card allows; grown after dropouts
+        self._out_name = None
+        self.out_opened_at = 0.0      # when the headphones were (re)opened: the first seconds don't count
         self._in = None
         self._out = None
         self._thread = None
@@ -545,6 +842,7 @@ class AudioEngine:
     def start(self, mic_name=None, out_name=None):
         self.stop()
         sd = get_sd()
+        self._out_name = out_name
         self.mic_error = self.out_error = ""
         idx, extra = _resolve(sd, out_name, "output")
         self._out = self._open(sd, "output", idx, extra, out_name)
@@ -552,6 +850,7 @@ class AudioEngine:
         self._in = self._open(sd, "input", idx, extra, mic_name)
         if self._out is not None:
             self._out.start()
+            self.out_opened_at = time.monotonic()
         if self._in is not None:
             self._in.start()
             self._running = True
@@ -574,8 +873,9 @@ class AudioEngine:
                     ch = 2 if info["max_output_channels"] >= 2 else 1
                     cls = sd.OutputStream
                     kw = {"callback": self._out_cb}
+                lat = self.out_latency if kind == "output" else "low"
                 stream = cls(device=dev, samplerate=SR, channels=ch, dtype="float32",
-                             blocksize=FRAME, latency="low", extra_settings=ex, **kw)
+                             blocksize=FRAME, latency=lat, extra_settings=ex, **kw)
                 note = ""
                 if wanted_name and (dev is None or sd.query_devices(dev)["name"] != wanted_name):
                     note = f"'{wanted_name}' unavailable, using the system default."
@@ -594,6 +894,31 @@ class AudioEngine:
         else:
             self.out_error = msg
         return None
+
+    def grow_output_buffer(self) -> bool:
+        """The headphones keep running dry (Telsiz was late, usually because the PC is flat out):
+        reopen them with OUT_LATENCY_SAFE of buffer instead of the minimum. Once per session."""
+        if self.out_latency != "low" or self._out is None:
+            return False
+        sd = get_sd()
+        try:
+            self._out.abort()
+            self._out.close()
+        except Exception:
+            pass
+        self._out = None
+        for lat in (OUT_LATENCY_SAFE, "low"):  # if the bigger buffer fails, go back to what worked
+            self.out_latency = lat
+            idx, extra = _resolve(sd, self._out_name, "output")
+            self._out = self._open(sd, "output", idx, extra, self._out_name)
+            if self._out is not None:
+                try:
+                    self._out.start()
+                    self.out_opened_at = time.monotonic()
+                    return lat == OUT_LATENCY_SAFE
+                except Exception:
+                    self._out = None
+        return False
 
     def stop(self):
         self._running = False
@@ -635,7 +960,9 @@ class AudioEngine:
     def _capture_loop(self):
         while self._running:
             try:
-                data, _overflow = self._in.read(FRAME)
+                data, overflow = self._in.read(FRAME)
+                if overflow:
+                    self.glitches["mic"] += 1  # Telsiz read too late: some microphone sound was lost
             except Exception as e:
                 self.mic_error = f"Microphone stopped: {e}. Press Refresh."
                 self.level_db = METER_MIN_DB
@@ -644,11 +971,17 @@ class AudioEngine:
             self.process_frame(data[:, 0].copy())
 
     def process_frame(self, x: np.ndarray):
-        """Gain, level meter, voice gate, encode and send one 20 ms frame."""
+        """Gain, level meter, voice gate, limiter, fades, encode and send one 20 ms frame."""
         x *= self.in_gain
         rms = float(np.sqrt(np.mean(x * x)))
         db = 20.0 * math.log10(rms + 1e-9)
         self.level_db = db
+        # the noise reducer's own idea of "you are talking": your level above the sensitivity mark
+        # (300 ms hang), or the push to talk key held. Independent of mute, so it keeps learning.
+        voice = db >= self.threshold_db or (self.mode == "ptt" and self.ptt_down)
+        self._nr_hang = HANG_FRAMES if voice else max(0, self._nr_hang - 1)
+        if self.denoise:  # runs on every frame while on, so it keeps up with the room's noise
+            x = self.nr.process(x, gate_open=self._nr_hang > 0)
         if self.muted or self.deafened:
             open_ = False
             self._hang = 0
@@ -660,10 +993,15 @@ class AudioEngine:
             elif self._hang > 0:
                 self._hang -= 1
             open_ = self._hang > 0
-        self.transmitting = open_
-        if not open_:
+        x = self.tx_limiter.process(x)  # always, so its 1 ms delay stays continuous
+        was = self._sending
+        self._sending = self.transmitting = open_
+        if not open_ and not was:
             return
-        np.clip(x, -1.0, 1.0, out=x)
+        if open_ and not was:
+            x[:FADE_IN] *= RAMP_UP     # start talking without a click
+        elif not open_:
+            x *= RAMP_DOWN             # one more frame, faded out: stop without a click
         if self.loopback:
             self.local.push(x.copy())
         send = self.sender
@@ -677,6 +1015,8 @@ class AudioEngine:
 
     # ---- playback side ----
     def _out_cb(self, outdata, frames, time_info, status):
+        if status and status.output_underflow:
+            self.glitches["out"] += 1  # the sound card ran dry: Telsiz was late with the last block
         try:
             mix = np.zeros(frames, np.float32)
             with self.voices_lock:
@@ -701,7 +1041,8 @@ class AudioEngine:
                 mix[:] = 0.0
             else:
                 mix *= self.out_gain
-                np.clip(mix, -1.0, 1.0, out=mix)
+            mix = self.out_limiter.process(mix)  # loud people and volumes over 100%: limited, never clipped
+            np.clip(mix, -1.0, 1.0, out=mix)
             outdata[:] = mix[:, None]
         except Exception:
             outdata.fill(0)
@@ -760,7 +1101,7 @@ class HostSession:
         self.clients: dict[tuple, _Peer] = {}
         self.lock = threading.Lock()
         self._next_id = 1
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock = _roomy(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         try:
             self.sock.bind(("0.0.0.0", port))
         except OSError:
@@ -1071,7 +1412,7 @@ class ClientSession:
         self.is_admin = False          # set when a Telsiz server accepts the admin password
         self.server_bans: list[dict] = []
         self.bans_version = 0
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock = _roomy(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         self.sock.bind(("0.0.0.0", 0))
         self.sock.settimeout(0.25)
         self.alive = True
@@ -1791,6 +2132,7 @@ DEFAULTS = {
     "ptt_key": None,
     "ptt_label": "",
     "ptt_sounds": True,
+    "noise_reduction": True,
     "user_volumes": {},
     "device_id": "",
     "bans": [],
@@ -2734,7 +3076,7 @@ class Controller:
         "set_field", "toggle_connection", "reveal", "copy_address",
         "toggle_mute", "toggle_deafen",
         "set_devices", "refresh_devices", "set_gain", "set_mode", "capture_key",
-        "set_threshold", "set_loopback", "set_chimes",
+        "set_threshold", "set_loopback", "set_chimes", "set_denoise",
         "set_user_volume", "kick", "watch",
         "join_room", "new_room", "delete_room",
         "screens", "start_share", "stop_share",
@@ -2786,6 +3128,9 @@ class Controller:
         self._shut = False
         self.done = threading.Event()
         self.tray = Tray()
+        self._drop_at = 0.0
+        self._drop_hist = collections.deque(maxlen=11)  # headphone dropout counts, one a second
+        self._settled = False
         self.updater = Updater(self)
         self._apply_engine_settings()
         self._populate_devices()
@@ -2827,6 +3172,7 @@ class Controller:
         e.threshold_db = float(s["threshold"])
         e.mode = s["mode"] if s["mode"] in ("voice", "ptt") else "voice"
         e.ptt_sounds = bool(s.get("ptt_sounds", True))
+        e.denoise = bool(s.get("noise_reduction", True))
         self.ptt.key_id = s["ptt_key"]
 
     # ---------- the picture the page draws ----------
@@ -2866,9 +3212,42 @@ class Controller:
             "mic": s["mic"] if s["mic"] in ins else DEFAULT_DEVICE,
             "out": s["speaker"] if s["speaker"] in outs else DEFAULT_DEVICE,
             "in_gain": round(e.in_gain * 100), "out_gain": round(e.out_gain * 100),
-            "loopback": bool(e.loopback), "chimes": bool(e.ptt_sounds),
-            "error": "\n".join(errs),
+            "loopback": bool(e.loopback), "chimes": bool(e.ptt_sounds), "denoise": bool(e.denoise),
+            "error": "\n".join(errs), "check": self._sound_check(),
         }
+
+    def _sound_check(self) -> str:
+        """One line for Audio settings: which Opus, and whether the sound card ever ran over or dry."""
+        lib = opus_library()
+        codec = (f"Opus {lib.version.replace('libopus', '').strip()} with error correction" if lib is not None
+                 else "Opus through PyAV, without error correction (libopus was not found)")
+        g = self.engine.glitches
+        if not (g["mic"] or g["out"]):
+            return codec + ". No sound card dropouts."
+        parts = [f"headphones {g['out']}" if g["out"] else "", f"microphone {g['mic']}" if g["mic"] else ""]
+        text = (codec + ". Dropouts so far: " + ", ".join(p for p in parts if p)
+                + ". Each one is a moment Telsiz was late for the sound card, usually because the PC was very busy.")
+        if self.engine.out_latency != "low":
+            text += f" The headphones now have a bigger buffer ({OUT_LATENCY_SAFE * 1000:.0f} ms) for fewer dropouts."
+        return text
+
+    def _sound_from(self, uid) -> str:
+        """How completely someone's sound reaches us (only after a few seconds of hearing them)."""
+        with self.engine.voices_lock:
+            v = self.engine.voices.get(uid)
+        if v is None:
+            return ""
+        st = v.stats
+        total = st["played"] + st["recovered"] + st["concealed"]
+        if total < 250:
+            return ""
+        fixed, guessed = 100.0 * st["recovered"] / total, 100.0 * st["concealed"] / total
+        text = ("All of their sound has arrived." if fixed + guessed < 0.05 else
+                f"Their sound: {fixed:.1f}% rebuilt by error correction, {guessed:.1f}% guessed (lost on the way).")
+        if st["underruns"]:
+            n = st["underruns"]
+            text += " Waited for late sound once." if n == 1 else f" Waited for late sound {n} times."
+        return text
 
     def _conn_state(self, sess):
         if sess is None:
@@ -2913,6 +3292,7 @@ class Controller:
                     "muted": bool(statuses.get(uid, 0) & S_MUTED),
                     "deafened": bool(statuses.get(uid, 0) & S_DEAFENED),
                     "speaking": here and uid in speaking, "vol": int(vols.get(name, 100)),
+                    "sound": self._sound_from(uid) if here and uid != my_id else "",
                     "watchable": self._can_watch(uid), "watching": self.viewer is not None and self.viewer.uid == uid}
 
         if rooms is not None:
@@ -3415,6 +3795,11 @@ class Controller:
         self._schedule_save()
         return {"ok": True}
 
+    def set_denoise(self, on):
+        self.engine.denoise = self.s["noise_reduction"] = bool(on)
+        self._schedule_save()
+        return {"ok": True}
+
     def toggle_mute(self):
         self.engine.muted = not self.engine.muted
         if self.engine.muted and self.engine.ptt_down:
@@ -3426,7 +3811,30 @@ class Controller:
         return {"deafened": self.engine.deafened}
 
     # ---------- the tick: everything that changes on its own ----------
+    def _watch_dropouts(self):
+        """Once a second: 5 or more headphone dropouts within 10 seconds make Telsiz give the
+        headphones a bigger buffer (a little more delay, far fewer crackles). The first 10 seconds
+        after the headphones open don't count: starting up (Telsiz, its window, other programs)
+        causes a few, and they say nothing about how it will run."""
+        now = time.monotonic()
+        if now - self._drop_at < 1.0:
+            return
+        self._drop_at = now
+        e = self.engine
+        if now - e.out_opened_at < 10.0:
+            self._drop_hist.clear()
+            self._settled = False
+            return
+        if not self._settled:  # just settled: count from here on
+            self._settled = True
+            e.glitches = {"mic": 0, "out": 0}
+        self._drop_hist.append(self.engine.glitches["out"])
+        if self.engine.out_latency == "low" and len(self._drop_hist) >= 2 and self._drop_hist[-1] - self._drop_hist[0] >= 5:
+            if self.engine.grow_output_buffer():
+                self._drop_hist.clear()
+
     def _tick(self):
+        self._watch_dropouts()
         while True:
             try:
                 cmd = UI_EVENTS.get_nowait()
@@ -3686,7 +4094,26 @@ def _notice_box(message: str):
             pass
 
 
+def raise_priority():
+    """Ask the system to run Telsiz ahead of ordinary programs. Its sound is late for the sound card
+    (a crackle) whenever a game keeps every core busy and Telsiz has to wait its turn; Telsiz itself
+    uses only a few percent of one core, so this can't slow the game down. Windows: "above normal",
+    never "high". Elsewhere raising priority needs privileges a normal user lacks, so it is only tried."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            return bool(k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00008000))  # ABOVE_NORMAL_PRIORITY_CLASS
+        os.setpriority(os.PRIO_PROCESS, 0, -5)
+        return True
+    except Exception:
+        return False
+
+
 def main():
+    raise_priority()
     missing = []
     for mod in ("numpy", "sounddevice", "av"):
         try:

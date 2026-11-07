@@ -590,6 +590,7 @@
     return h('div', { class: 'panel' },
       h('div', { class: 'lbl', text: here ? 'Volume for ' + m.name : m.name + ' is in another room. Their volume is kept for when you meet.' }),
       h('div', { class: 'vol' }, range, out),
+      here ? h('div', { class: 'lbl net', text: m.sound || '' }) : null,
       buttons.childNodes.length ? buttons : null);
   }
 
@@ -603,8 +604,14 @@
     const s = ui.s;
     if (!s.people) return;
     const on = new Set();
-    for (const r of s.people.rooms) for (const m of r.members) if (m.speaking) on.add(String(m.uid));
+    let sound = '';
+    for (const r of s.people.rooms) for (const m of r.members) {
+      if (m.speaking) on.add(String(m.uid));
+      if (m.uid === ui.openPerson) sound = m.sound || '';
+    }
     document.querySelectorAll('#people .person').forEach((row) => row.classList.toggle('speaking', on.has(row.dataset.uid)));
+    const net = $('#people .panel .net');  // the open person's sound quality, updated in place
+    if (net && net.textContent !== sound) net.textContent = sound;
   }
 
   async function joinRoom(r) {
@@ -755,11 +762,15 @@
       setting(voice ? 'Sensitivity' : 'Input level', meterBox,
         voice ? 'Click or drag on the bar. Below the white mark you stay quiet; above it you are on air and the bar lights up fully. Keep keyboard noise below the mark.'
               : 'The bar lights up fully while you hold your key and talk.', true),
+      setting('Noise reduction', sw(a.denoise, (v) => api('set_denoise', { on: v }), 'Noise reduction'),
+        'Turns down steady background noise such as fans, hum and hiss in what you send. Sudden noises like key clicks stay.'),
 
       h('h3', { text: 'Checks' }),
       setting('Hear myself (mic test)', sw(a.loopback, (v) => api('set_loopback', { on: v }), 'Hear myself')),
       setting('Push to talk sounds', sw(a.chimes, (v) => api('set_chimes', { on: v }), 'Push to talk sounds'),
         'A rising chime when you go on air and a falling one when you let go. Only you hear them.'),
+      h('div', { class: 'setting' }, h('div', { class: 'name', text: 'Sound check' }),
+        h('div', { class: 'desc', id: 'snd-check', text: a.check })),
 
       h('h3', { text: 'Updates' }),
       setting('Check for updates', sw(s.update.auto, (v) => api('update_auto', { on: v }), 'Check for updates'),
@@ -794,6 +805,8 @@
       const t = s.ptt.capturing ? 'Press a key or mouse side button…' : s.ptt.label ? 'Key: ' + s.ptt.label : 'Set key';
       if (key.textContent !== t) key.textContent = t;
     }
+    const chk = $('#snd-check');
+    if (chk && chk.textContent !== s.audio.check) chk.textContent = s.audio.check;
     const err = $('#audio-err');
     if (err) {
       err.hidden = !s.audio.error;

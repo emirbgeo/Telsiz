@@ -9,7 +9,7 @@
   No accounts, no company in between: one PC hosts the room, or a five dollar server does, and everyone joins with an address and a password.
 </p>
 
-<p align="center"><b>Windows 10 and 11 · Linux</b> · version 1.6</p>
+<p align="center"><b>Windows 10 and 11 · Linux</b> · version 1.7</p>
 
 ![Telsiz: a server room with a live screen share and people talking, hosting from a PC with the addresses hidden for streaming, and the update dialog](docs/preview.png)
 
@@ -55,7 +55,9 @@ There are no accounts, no text chat, no webcams and no telemetry. Apart from the
 
 ## 2. Highlights
 
-* **Clear, low latency voice.** Opus at 32 kbit/s (48 kHz, mono, 20 ms frames), an adaptive jitter buffer between 40 and 120 ms, and concealment of lost packets.
+* **Clear, low latency voice.** Opus at 48 kbit/s (48 kHz, mono, 20 ms frames) with in band error correction, so a lost packet is rebuilt from the next one, and Opus's own concealment for the rest. An adaptive jitter buffer between 40 and 120 ms.
+* **Clean at any volume.** A limiter turns loud moments down smoothly instead of chopping off the tops of the waveform, so people and the output can go up to 200% without crackling.
+* **Noise reduction** turns down steady background noise (fans, hum, hiss) in what you send. It is on by default and has a switch.
 * **Voice activity or push to talk.** Drag a sensitivity mark on a live level bar, or hold any keyboard key or mouse side button. Optional chimes, which only you hear, tell you when you are on air.
 * **The usual controls.** Microphone and headphone choice, mic and output volume, per person volume from 0 to 200%, Mute, Deafen, and a "hear myself" mic test.
 * **You can see who is talking.** People's rings light up while they speak. Muted and deafened people are marked for everyone.
@@ -179,7 +181,7 @@ Versions before 1.6 have no update check. Everyone needs to download 1.6 by hand
 
 **The bottom bar** has **Mute mic**, **Deafen** and **Audio**.
 
-**Audio settings** hold Devices (microphone, headphones, **Refresh** after plugging in a headset), Levels (mic and output volume, 0 to 200%), Talking (talk mode, push to talk key, the sensitivity bar), Checks (**Hear myself**, **Push to talk sounds**), Updates (**Check for updates**, **Check now**) and **Quit Telsiz**. Everything is saved as you change it.
+**Audio settings** hold Devices (microphone, headphones, **Refresh** after plugging in a headset), Levels (mic and output volume, 0 to 200%), Talking (talk mode, push to talk key, the sensitivity bar, **Noise reduction**), Checks (**Hear myself**, **Push to talk sounds**, and the **Sound check** line), Updates (**Check for updates**, **Check now**) and **Quit Telsiz**. Everything is saved as you change it.
 
 Questions (kick, ban, delete a room), the share dialog, Bans and the update dialog all open inside the window. In yes or no questions the safe answer has the keyboard focus, so pressing Enter never kicks anyone.
 
@@ -198,11 +200,16 @@ In **Audio**, set **Talk mode** to **Push to talk**, press **Set key**, then pre
 * **Push to talk sounds:** a rising chime when you go on air and a falling one when you let go. Only you hear them. Switch them off in Audio.
 * **Games running as administrator:** Windows hides key presses from programs that are not, so run Telsiz as administrator too.
 
+### Noise reduction
+
+**Noise reduction** (Audio settings, Talking, on by default) turns down steady background noise in what you send: PC fans, air conditioning, mains hum, microphone hiss. It learns the noise while you are quiet and turns each frequency band down by how much of it is noise, by at most 15 dB, so your voice keeps its natural sound. Sudden noises such as key clicks are not steady, so they stay: keep those below the sensitivity mark or use push to talk. It adds 10 ms of delay. If your voice ever sounds watery to others, switch it off.
+
 ### Mute, deafen and volumes
 
 * **Mute mic** stops sending. **Deafen** silences everyone else and mutes you as well. Others see **Muted** or **Deafened** next to your name (on Telsiz servers 1.4 or newer and when the host runs 1.4 or newer).
 * On Windows the tray icon's menu has Mute mic and Deafen too. The tray icon turns teal while you transmit and red while you are muted.
-* **Per person volume:** click a person and drag their slider (0 to 200%). Telsiz remembers it by name.
+* **Per person volume:** click a person and drag their slider (0 to 200%). Telsiz remembers it by name. Turning someone up past 100% is safe: the limiter keeps their loud moments from crackling.
+* **How someone's sound arrives:** the same panel shows, after a few seconds of hearing them, how much of their sound was rebuilt by error correction or guessed because it was lost on the way, and how often Telsiz had to wait for late sound. A few percent or more means their connection (often Wi Fi) is losing packets.
 * **Hear myself** plays your own microphone back to you, to check how you sound.
 
 ---
@@ -296,7 +303,7 @@ Telsiz was built by someone who streams.
 ## 13. Settings and your data
 
 * **Where:** `%APPDATA%\Telsiz\settings.json` on Windows, `~/.config/Telsiz/settings.json` on Linux.
-* **What:** your name, devices, volumes and sensitivity, talk mode and push to talk key, per person volumes (by name), the bans you made as a PC host, this install's device ID, the last room you were in on each server (stored under a hash, so the address itself is not written down), and the update settings. With **Remember address** and **Remember password** switched on, the join address and password are stored too, **in plain text**. Switching them off also deletes what was stored.
+* **What:** your name, devices, volumes and sensitivity, talk mode and push to talk key, noise reduction on or off, per person volumes (by name), the bans you made as a PC host, this install's device ID, the last room you were in on each server (stored under a hash, so the address itself is not written down), and the update settings. With **Remember address** and **Remember password** switched on, the join address and password are stored too, **in plain text**. Switching them off also deletes what was stored.
 * **Starting fresh:** quit Telsiz and delete the `Telsiz` settings folder. You get a new device ID, so kicks and bans tied to the old one no longer apply to you.
 * **On a server:** settings and passwords are in `/var/lib/telsiz/server.json`, rooms in `/var/lib/telsiz/telsiz_rooms.json`, bans in `/var/lib/telsiz/telsiz_bans.json`.
 
@@ -312,7 +319,9 @@ Telsiz was built by someone who streams.
 
 **Microphone or headphones error.** Pick another device in Audio settings and press **Refresh** (also needed after plugging in a new headset). If you have no microphone at all, **Got it** hides the warning.
 
-**Choppy or robotic voice.** Usually the host's upload or someone's Wi Fi. A network cable fixes most of it.
+**Crackling, static or dropouts.** Open Audio settings and read the **Sound check** line. If it counts headphone or microphone dropouts, Telsiz was late for the sound card, usually because the PC was flat out (a game using every core). Close what you don't need; Telsiz already asks Windows to give it priority, and gives the headphones a bigger buffer by itself after repeated dropouts. If there are no dropouts, click the person who sounds bad: their panel says whether their packets are getting lost. Volumes over 100% no longer crackle in 1.7 or newer.
+
+**Choppy or robotic voice.** Usually the host's upload or someone's Wi Fi: the person's panel shows how much of their sound had to be rebuilt or guessed. A network cable fixes most of it.
 
 **Push to talk does nothing in a game.** Run Telsiz as administrator if the game runs as administrator. On Linux, see the Wayland note in [Installing](#linux).
 
@@ -373,6 +382,7 @@ assets/, docs/        icon and the pictures in this README
 | `TELSIZ_PRINT_URL=1` | Also print the page address when the window opens. |
 | `TELSIZ_UPDATE_URL` | Ask this address instead of GitHub for the latest release (a local test server). |
 | `TELSIZ_UPDATE_DELAY` | Seconds before the first update check (default 8). |
+| `TELSIZ_OPUS=pyav` | Use Opus through PyAV instead of libopus directly (no error correction decoding), as 1.6 did. |
 | `TELSIZ_TRAY=1` | Try a tray icon outside Windows. |
 | `TELSIZ_PYTHON` | The Python that `run_linux.sh` uses. |
 
@@ -420,7 +430,8 @@ flowchart LR
     C -. "HTTPS, once a day" .-> G["GitHub releases"]
 ```
 
-* **Audio.** PortAudio (through `sounddevice`) records 20 ms frames at 48 kHz. Voice activity or push to talk decides whether a frame is sent. Frames are encoded with Opus (through PyAV) and sent over UDP. On the way in, each person gets an adaptive jitter buffer (40 to 120 ms) and lost frames are concealed. Everyone is mixed with their own volume and played to your headphones.
+* **Audio, sending.** PortAudio (through `sounddevice`) records 20 ms frames at 48 kHz. Noise reduction runs on every frame (a Wiener filter whose noise estimate is learned while the voice gate is shut). Voice activity or push to talk decides whether a frame is sent; the first frame fades in and one faded out frame follows the last, so starting and stopping never clicks. A peak limiter keeps the signal under full scale. Opus encodes it at 48 kbit/s with in band error correction, by calling libopus directly (the copy inside PyAV's packages), and it goes out over UDP.
+* **Audio, receiving.** Each person gets an adaptive jitter buffer (40 to 120 ms) that puts packets back in order. A packet still missing when its turn comes is rebuilt from the error correction data in the next packet, or concealed by Opus. Everyone is mixed with their own volume, the output volume is applied, and a second limiter keeps the mix clean before it reaches your headphones.
 * **The room.** Whoever holds the room, a PC that hosts or a Telsiz server, relays each speaker's packets to the others in the same room without decoding them. The protocol is plain UDP: join, welcome, voice, ping, roster, and messages for rooms, statuses, kicks and screen sharing. Join requests are padded to 256 bytes so a reply is never larger than the request, which keeps the server from being used to amplify floods.
 * **Screen sharing.** `mss` captures the screen, x264 encodes it for low latency, and pictures travel in pieces of about 1150 bytes. The server keeps recent pieces, so a viewer can ask for lost ones again, and a viewer can ask for a full picture at any time.
 * **The window** is a web page drawn by the system's web engine through pywebview. The page talks to `telsiz.py` over HTTP on `127.0.0.1` only, under a random key created at each start, and can only call a fixed list of actions. A web page in your normal browser, or another program, can't read Telsiz's state or press its buttons without that key.
@@ -431,7 +442,7 @@ flowchart LR
 
 ## 18. Bandwidth and limits
 
-**Bandwidth.** Each person who is talking costs about 45 to 50 kbit/s for every listener. Whoever holds the room sends that to everyone else, so a PC host's upload is the bottleneck: six people with two talking at once is roughly 0.5 Mbit/s up. Nobody sends anything while silent. Screen sharing costs at most 1.5 Mbit/s per viewer.
+**Bandwidth.** Each person who is talking costs about 50 to 55 kbit/s for every listener (Opus uses about 39 kbit/s on average at its 48 kbit/s setting; the rest is packet headers). Whoever holds the room sends that to everyone else, so a PC host's upload is the bottleneck: six people with two talking at once is roughly 0.5 Mbit/s up. Nobody sends anything while silent. Screen sharing costs at most 1.5 Mbit/s per viewer.
 
 **Limits.**
 
@@ -452,6 +463,19 @@ flowchart LR
 ---
 
 ## 20. Changelog
+
+### 1.7 (November 2026)
+
+Better sound. Every change below was measured with PESQ (ITU-T P.862, 1 is bad, 4.5 excellent) on synthesized Turkish and English speech run through Telsiz's own audio code over a simulated network; the numbers are for comparing versions, not absolute.
+
+* **Volumes over 100% no longer crackle.** The mix was cut off hard at full scale, so a loud voice turned up to 200% got its peaks chopped. A limiter now turns loud moments down smoothly instead. Person at 200% and output at 200%: 1.24 before, 3.79 now. Mic volume at 200%: 2.26 before, 4.01 now.
+* **Lost and late packets are repaired.** Telsiz now calls libopus directly (the copy inside PyAV's packages) and uses Opus's in band error correction: a lost packet is rebuilt from the next one, and Opus conceals the rest. 1.6 repeated the last 20 ms at half volume, which clicked at both ends. Voice now uses 48 kbit/s (about 39 kbit/s actually sent). Averages over six runs with 10 to 40 ms of jitter: 2% loss 2.67 before, 3.92 now; 5% loss 2.06 before, 3.39 now; heavy jitter 3.29 before, 3.91 now.
+* **Noise reduction** (on by default, switch in Audio settings) turns down fans, hum and hiss in what you send. With PC fan, mains hum, hiss and keyboard noise: 1.99 before, 2.69 now. A clean voice barely changes (4.26 off, 4.21 on).
+* **No clicks when someone starts or stops talking:** the first frame fades in, and a faded out frame follows the last.
+* **Fewer crackles when the PC is flat out.** Telsiz asks Windows to run it ahead of ordinary programs (above normal priority; it uses a few percent of one core). If the headphones still run dry repeatedly, Telsiz gives them a 60 ms buffer instead of the minimum.
+* **You can see what is wrong.** Audio settings show a **Sound check** line (codec and sound card dropouts), and a person's panel shows how much of their sound had to be rebuilt or guessed.
+* Bigger network buffers, so a burst of screen sharing can't push voice packets out.
+* 1.6 and 1.7 understand each other in both directions, so friends can update at their own pace. The server needs no update.
 
 ### 1.6 (November 2026)
 

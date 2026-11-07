@@ -493,6 +493,7 @@ select.input option { background: var(--slab); color: var(--text); }
 .panel .vol { display: grid; grid-template-columns: 1fr 48px; gap: 10px; align-items: center; }
 .panel .vol output { font-size: 12.5px; color: var(--mute); text-align: right; font-variant-numeric: tabular-nums; }
 .panel .lbl { font-size: 12px; color: var(--mute); }
+.panel .net:empty { display: none; }
 
 /* Sliders drawn by us, so WebView2 and WebKitGTK look the same. --fill is set by the page. */
 input[type="range"] {
