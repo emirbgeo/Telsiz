@@ -43,12 +43,30 @@
       <button class="dock-btn" id="btn-mute"></button>
       <button class="dock-btn" id="btn-deaf"></button>
       <button class="dock-btn" id="btn-audio2"></button>
+      <button class="dock-btn" id="btn-chat" aria-pressed="false" aria-controls="chat"></button>
     </nav>
 
     <aside id="audio" class="settings" hidden aria-label="Audio settings"></aside>
     <aside id="bans" class="settings" hidden aria-label="Bans"></aside>
-    <div id="modal" class="modal" hidden></div>
   </div>
+
+  <aside id="chat" class="chat" hidden aria-label="Chat">
+    <header class="chat-head">
+      <svg class="isolines" aria-hidden="true" viewBox="0 0 400 200" preserveAspectRatio="xMidYMid slice"></svg>
+      <div class="chat-title"><h2>Chat</h2><small id="chat-where"></small></div>
+      <button class="icon-btn" id="chat-close" title="Close chat" aria-label="Close chat"></button>
+    </header>
+    <p class="chat-note" id="chat-note" hidden></p>
+    <div class="chat-log" id="chat-log" role="log" aria-live="polite" aria-label="Messages" tabindex="0"></div>
+    <button class="chat-jump" id="chat-jump" type="button" hidden>New messages</button>
+    <form class="chat-compose" id="chat-compose" autocomplete="off">
+      <textarea id="chat-input" class="input" rows="1" maxlength="500" placeholder="Message" aria-label="Message" spellcheck="true"></textarea>
+      <button class="send" id="chat-send" type="submit" title="Send (Enter)" aria-label="Send"></button>
+    </form>
+    <p class="chat-hint" id="chat-hint">Enter sends, Shift+Enter starts a new line.</p>
+  </aside>
+
+  <div id="modal" class="modal" hidden></div>
   <canvas id="fx" aria-hidden="true"></canvas>
 
   <script src="fx.js"></script>

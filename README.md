@@ -9,7 +9,7 @@
   No accounts, no company in between: one PC hosts the room, or a five dollar server does, and everyone joins with an address and a password.
 </p>
 
-<p align="center"><b>Windows 10 and 11 · Linux</b> · version 1.7</p>
+<p align="center"><b>Windows 10 and 11 · Linux</b> · version 1.8.1</p>
 
 ![Telsiz: a server room with a live screen share and people talking, hosting from a PC with the addresses hidden for streaming, and the update dialog](docs/preview.png)
 
@@ -25,18 +25,19 @@
 6. [A tour of the window](#6-a-tour-of-the-window)
 7. [Talking: voice activity and push to talk](#7-talking-voice-activity-and-push-to-talk)
 8. [Rooms and screen sharing](#8-rooms-and-screen-sharing)
-9. [Hosting on your PC](#9-hosting-on-your-pc)
-10. [Running a Telsiz server](#10-running-a-telsiz-server)
-11. [Kick, ban and admins](#11-kick-ban-and-admins)
-12. [Streaming and privacy](#12-streaming-and-privacy)
-13. [Settings and your data](#13-settings-and-your-data)
-14. [Troubleshooting](#14-troubleshooting)
-15. [Running and building from source](#15-running-and-building-from-source)
-16. [Releasing a new version](#16-releasing-a-new-version)
-17. [How it works inside](#17-how-it-works-inside)
-18. [Bandwidth and limits](#18-bandwidth-and-limits)
-19. [Credits and licences](#19-credits-and-licences)
-20. [Changelog](#20-changelog)
+9. [Text chat](#9-text-chat)
+10. [Hosting on your PC](#10-hosting-on-your-pc)
+11. [Running a Telsiz server](#11-running-a-telsiz-server)
+12. [Kick, ban and admins](#12-kick-ban-and-admins)
+13. [Streaming and privacy](#13-streaming-and-privacy)
+14. [Settings and your data](#14-settings-and-your-data)
+15. [Troubleshooting](#15-troubleshooting)
+16. [Running and building from source](#16-running-and-building-from-source)
+17. [Releasing a new version](#17-releasing-a-new-version)
+18. [How it works inside](#18-how-it-works-inside)
+19. [Bandwidth and limits](#19-bandwidth-and-limits)
+20. [Credits and licences](#20-credits-and-licences)
+21. [Changelog](#21-changelog)
 
 ---
 
@@ -46,10 +47,10 @@
 
 There are two ways to run a room:
 
-* **Host on your PC.** One person presses **Start hosting** and the others join that PC's address. Nothing to rent, but the host's router has to let friends in (see [Hosting on your PC](#9-hosting-on-your-pc)).
-* **Run a Telsiz server.** A tiny program on a rented Linux server (a VPS for about five dollars a month) holds the room. Everyone, the owner included, simply joins it. Nobody's home address is involved, and you also get **rooms** and **screen sharing** (see [Running a Telsiz server](#10-running-a-telsiz-server)).
+* **Host on your PC.** One person presses **Start hosting** and the others join that PC's address. Nothing to rent, but the host's router has to let friends in (see [Hosting on your PC](#10-hosting-on-your-pc)).
+* **Run a Telsiz server.** A tiny program on a rented Linux server (a VPS for about five dollars a month) holds the room. Everyone, the owner included, simply joins it. Nobody's home address is involved, and you also get **rooms** and **screen sharing** (see [Running a Telsiz server](#11-running-a-telsiz-server)).
 
-There are no accounts, no text chat, no webcams and no telemetry. Apart from the voice room itself, Telsiz only ever contacts two places: `api.ipify.org`, to show a host their own Internet address, and GitHub, once a day, to see whether a newer version exists (you can switch that off).
+Every room also has a **text chat** beside it (see [Text chat](#9-text-chat)). There are no accounts, no webcams and no telemetry. Apart from the voice room itself, Telsiz only ever contacts two places: `api.ipify.org`, to show a host their own Internet address, and GitHub, once a day, to see whether a newer version exists (you can switch that off).
 
 ---
 
@@ -61,6 +62,7 @@ There are no accounts, no text chat, no webcams and no telemetry. Apart from the
 * **Voice activity or push to talk.** Drag a sensitivity mark on a live level bar, or hold any keyboard key or mouse side button. Optional chimes, which only you hear, tell you when you are on air.
 * **The usual controls.** Microphone and headphone choice, mic and output volume, per person volume from 0 to 200%, Mute, Deafen, and a "hear myself" mic test.
 * **You can see who is talking.** People's rings light up while they speak. Muted and deafened people are marked for everyone.
+* **Text chat, one per room**, in a panel beside the room: the window grows sideways to make space. Whoever holds the room keeps the history, so people who arrive later can read back. Links open in your browser; messages are plain text and can't run anything.
 * **Rooms and screen sharing** on a Telsiz server: admins create and delete rooms, and anyone can share a screen (720p at 15 fps, or 1080p at 5 fps for text) to the people in their room who press Watch.
 * **Kick and ban**, by device and by Internet address.
 * **Safe to stream.** Addresses show as dots until you press Show, and Copy works without revealing them.
@@ -145,7 +147,7 @@ It depends on how you run Telsiz:
 | **a git clone** | Runs `git pull --ff-only`, which refuses rather than overwrite changes of your own, installs new libraries the same way, and restarts. |
 | **from a folder Telsiz can't write to** (such as Program Files) | Opens the release page in your browser so you can download it yourself. |
 
-Your settings live elsewhere (see [Settings and your data](#13-settings-and-your-data)) and are never touched by an update.
+Your settings live elsewhere (see [Settings and your data](#14-settings-and-your-data)) and are never touched by an update.
 
 ### Safety
 
@@ -164,7 +166,7 @@ Versions before 1.6 have no update check. Everyone needs to download 1.6 by hand
 ## 6. A tour of the window
 
 <p align="center">
-  <img src="docs/room.png" width="300" alt="Connected to a server: the room card with Share screen, Watch and Leave, then the rooms Lobby, CS2 and Minecraft with the people in each">
+  <img src="docs/room.png" width="300" alt="Connected to a server: the room card with Share screen and Leave, then the rooms Lobby, CS2 and Minecraft with the people in each, Ali talking and Berk muted, and the bottom bar with one new chat message waiting">
   &nbsp;
   <img src="docs/audio.png" width="300" alt="Audio settings: microphone, headphones, Refresh, mic and output volume, talk mode, the sensitivity bar">
 </p>
@@ -179,9 +181,9 @@ Versions before 1.6 have no update check. Everyone needs to download 1.6 by hand
 
 **People** lists everyone. On a server, rooms are headings: point at one to get **Join**, and admins also get **Delete**. A person's ring lights up while they talk; labels show **Muted**, **Deafened** and **Live**. **Click a person** (or right click) for their volume slider and, when they apply, **Watch**, **Kick** and **Ban**. Below the list, hosts and admins find **New room** and **Bans**.
 
-**The bottom bar** has **Mute mic**, **Deafen** and **Audio**.
+**The bottom bar** has **Mute mic**, **Deafen**, **Audio** and **Chat**. Chat shows a count of new messages while it is closed.
 
-**Audio settings** hold Devices (microphone, headphones, **Refresh** after plugging in a headset), Levels (mic and output volume, 0 to 200%), Talking (talk mode, push to talk key, the sensitivity bar, **Noise reduction**), Checks (**Hear myself**, **Push to talk sounds**, and the **Sound check** line), Updates (**Check for updates**, **Check now**) and **Quit Telsiz**. Everything is saved as you change it.
+**Audio settings** hold Devices (microphone, headphones, **Refresh** after plugging in a headset), Levels (mic and output volume, 0 to 200%), Talking (talk mode, push to talk key, the sensitivity bar, **Noise reduction**), Checks (**Hear myself**, **Push to talk sounds**, **Message sound**, the **Sound check** line, and the **Connection** line, which counts dropped connections), Updates (**Check for updates**, **Check now**) and **Quit Telsiz**. Everything is saved as you change it.
 
 Questions (kick, ban, delete a room), the share dialog, Bans and the update dialog all open inside the window. In yes or no questions the safe answer has the keyboard focus, so pressing Enter never kicks anyone.
 
@@ -238,7 +240,27 @@ Both need a Telsiz server (1.3 or newer). Hosting from a PC has one room and no 
 
 ---
 
-## 9. Hosting on your PC
+## 9. Text chat
+
+Every room has its own chat: the Lobby and each room on a Telsiz server, and the one room a PC hosts. Moving to another room shows that room's chat.
+
+<p align="center"><img src="docs/chat.png" width="560" alt="The window widened for the chat: on the left the CS2 room with Ali talking and Berk muted, on the right the CS2 chat with names in colour, a link, a message naming Emir marked in amber, and a reply being typed"></p>
+
+* **Opening it.** **Chat** in the bottom bar opens the chat beside the room, and the window grows by the chat's width to make space, toward whichever side of the screen has room. Closing it (× or **Chat** again) shrinks the window back. A window that is already wide (maximized, say) doesn't grow: the chat takes its right side. A narrow window on a screen with no room to grow gets the chat over the whole window instead, and Esc closes it. Telsiz remembers whether the chat was open.
+* **Writing.** Enter sends, Shift+Enter starts a new line, up to 500 characters. While you type in the message box, a push to talk key that types letters (V, say) doesn't put you on air; mouse buttons and keys that don't type, such as Caps Lock or F13, work as usual.
+* **History.** Whoever holds the room keeps every message: a Telsiz server in `/var/lib/telsiz/chat`, a PC that hosts in its settings folder. When you arrive you get the newest 100; **Show older messages** fetches 50 more at a time, back to the last 1000. Older ones stay in the log file.
+* **Links** (http and https) open in your web browser, never inside Telsiz. Messages are plain text: nothing in a message can run, load or change anything in the window.
+* **Your name** in someone's message marks it with an amber bar.
+* **New messages** show as a count on the Chat button while the chat is closed, and play a short, quiet sound while you aren't looking at the chat (in a game, say). The sound has a switch: Audio settings, Checks, **Message sound**. Deafen silences it too.
+* **Deleting.** Point at a message and press the bin. Everyone can delete their own messages; admins on a server and the host of a PC room can delete anyone's. Everyone then sees *Message deleted*. The text stays in the log file on the server or the host's PC.
+* **It doesn't lose messages.** The room numbers every message and confirms it to the sender; Telsiz sends a message again until it is confirmed, never posts it twice, keeps your messages in the order you wrote them, and fetches whatever it missed during a dropout. Tested with 30% of packets lost in both directions plus duplicated and reordered packets: every message arrived, once, in order.
+* **Too fast.** A person can send 8 messages in a row, then one a second. Telsiz holds the rest and sends them as soon as they are allowed; nothing is dropped.
+* **Older Telsiz.** Chat needs Telsiz 1.8 and a Telsiz server 1.5 or newer, or a PC host on 1.8. Friends on 1.7 or older stay in the room and talk as before but don't see the chat, and the chat says how many such people are in the room. On an older server or host, the chat says it isn't available there.
+* **Not private.** Like voice, chat crosses the internet unencrypted. Everyone in the room reads it, and whoever runs the server, or hosts, can read every message in the log files, deleted ones included.
+
+---
+
+## 10. Hosting on your PC
 
 The host's PC must be reachable on one UDP port (default 50505). The first time you host, Windows Firewall asks for permission: allow it.
 
@@ -256,7 +278,7 @@ A PC hosts up to 15 guests. **Set a room password**, especially with a static IP
 
 ---
 
-## 10. Running a Telsiz server
+## 11. Running a Telsiz server
 
 A Telsiz server is a room that lives on a rented Linux machine instead of your PC. It only passes packets along: it decodes nothing, needs no sound card, and used under 1% of one CPU core in testing, even relaying a screen share to three viewers. The full guide, with providers and prices, is **[server/SERVER.md](server/SERVER.md)**. In short:
 
@@ -272,13 +294,13 @@ curl -fsSL https://github.com/emirbgeo/Telsiz/archive/refs/heads/main.tar.gz | t
 sh /root/telsiz-src/server/install_server.sh
 ```
 
-Passwords, bans and rooms live in `/var/lib/telsiz` and survive updates. Never delete that folder unless you want new passwords.
+Passwords, bans, rooms and chat logs live in `/var/lib/telsiz` and survive updates. Never delete that folder unless you want new passwords.
 
-Apps and servers of different versions work together: apps from 1.1 on can join newer servers and talk, and simply miss the newer features.
+Apps and servers of different versions work together: apps from 1.1 on can join newer servers and talk, and simply miss the newer features. Text chat needs server 1.5.
 
 ---
 
-## 11. Kick, ban and admins
+## 12. Kick, ban and admins
 
 * **Who can:** the host when hosting from a PC; people who joined a server with its admin password.
 * **Kick** removes someone for now. On a PC host they can't rejoin until the host stops and starts hosting again. On a server they stay out until everyone has left the room or the server restarts.
@@ -289,37 +311,50 @@ Apps and servers of different versions work together: apps from 1.1 on can join 
 
 ---
 
-## 12. Streaming and privacy
+## 13. Streaming and privacy
 
 Telsiz was built by someone who streams.
 
 * Addresses show as dots until you press **Show**; **Copy** works without revealing them. The join address field is hidden the same way. Status lines and error messages never contain an address.
 * Everyone who joins your PC's room knows your Internet address, because they typed it. Hiding it only protects you from stream viewers. A Telsiz server avoids the problem completely: friends only ever see the server's address.
 * Screen sharing shows your whole screen. Close private things before you share.
+* The chat panel is part of the window, so it is on stream whenever the window is. Friends should know that before they type something private. Admins (and the host) can delete a message, which removes it from everyone's screen at once.
 * Telsiz contacts `api.ipify.org` only while **Host a room** is selected (to show your Internet address) and GitHub once a day for updates. Nothing else leaves your PC except your voice and, if you share, your screen.
 
 ---
 
-## 13. Settings and your data
+## 14. Settings and your data
 
 * **Where:** `%APPDATA%\Telsiz\settings.json` on Windows, `~/.config/Telsiz/settings.json` on Linux.
-* **What:** your name, devices, volumes and sensitivity, talk mode and push to talk key, noise reduction on or off, per person volumes (by name), the bans you made as a PC host, this install's device ID, the last room you were in on each server (stored under a hash, so the address itself is not written down), and the update settings. With **Remember address** and **Remember password** switched on, the join address and password are stored too, **in plain text**. Switching them off also deletes what was stored.
+* **What:** your name, devices, volumes and sensitivity, talk mode and push to talk key, noise reduction on or off, whether the chat was open and the message sound, per person volumes (by name), the bans you made as a PC host, this install's device ID, the last room you were in on each server (stored under a hash, so the address itself is not written down), and the update settings. With **Remember address** and **Remember password** switched on, the join address and password are stored too, **in plain text**. Switching them off also deletes what was stored.
+* **Connection log:** `connection.log` in the same folder gets a line whenever you join, drop out, get back in or leave: the time, the room, the reason, how long nothing had arrived, and your ping. It never contains an address, so you can send it to whoever helps you. It is cut back to its newer half at 256 KB.
 * **Starting fresh:** quit Telsiz and delete the `Telsiz` settings folder. You get a new device ID, so kicks and bans tied to the old one no longer apply to you.
-* **On a server:** settings and passwords are in `/var/lib/telsiz/server.json`, rooms in `/var/lib/telsiz/telsiz_rooms.json`, bans in `/var/lib/telsiz/telsiz_bans.json`.
+* **Chat you hosted:** when you host from your PC, the chat is saved in `hosted_chat\room-1.jsonl` in the same folder, one message per line. Delete the file to clear it.
+* **On a server:** settings and passwords are in `/var/lib/telsiz/server.json`, rooms in `/var/lib/telsiz/telsiz_rooms.json`, bans in `/var/lib/telsiz/telsiz_bans.json`, chat in `/var/lib/telsiz/chat/room-<number>.jsonl` (see [server/SERVER.md](server/SERVER.md)).
 
 ---
 
-## 14. Troubleshooting
+## 15. Troubleshooting
 
-**Telsiz doesn't start on Windows (no window, no message).** Telsiz.exe and `run_windows.bat` start without a console, so a crash before the window appears is silent. To see the error, open PowerShell in a Telsiz source folder (the exe runs the same code) and start it with a console: `py telsiz.py`. Whatever goes wrong is printed there. Version 1.5 crashed this way on Windows (see the [changelog](#20-changelog)); 1.6 fixes it.
+**Telsiz doesn't start on Windows (no window, no message).** Telsiz.exe and `run_windows.bat` start without a console, so a crash before the window appears is silent. To see the error, open PowerShell in a Telsiz source folder (the exe runs the same code) and start it with a console: `py telsiz.py`. Whatever goes wrong is printed there. Version 1.5 crashed this way on Windows (see the [changelog](#21-changelog)); 1.6 fixes it.
 
 **It opened in the web browser instead of its own window.** The window engine is missing: the WebView2 Runtime on Windows, WebKitGTK on Linux (which `run_linux.sh` installs). Everything works in the browser tab too. **Quit Telsiz** is in Audio settings, and on Windows also in the tray.
 
-**"No answer from the host."** The message says which case applies: a home address used from outside the home, nothing listening at that address, or packets that never arrive (router rule, firewall, CGNAT). See [Hosting on your PC](#9-hosting-on-your-pc).
+**"No answer from the host."** The message says which case applies: a home address used from outside the home, nothing listening at that address, or packets that never arrive (router rule, firewall, CGNAT). See [Hosting on your PC](#10-hosting-on-your-pc).
 
 **Microphone or headphones error.** Pick another device in Audio settings and press **Refresh** (also needed after plugging in a new headset). If you have no microphone at all, **Got it** hides the warning.
 
 **Crackling, static or dropouts.** Open Audio settings and read the **Sound check** line. If it counts headphone or microphone dropouts, Telsiz was late for the sound card, usually because the PC was flat out (a game using every core). Close what you don't need; Telsiz already asks Windows to give it priority, and gives the headphones a bigger buffer by itself after repeated dropouts. If there are no dropouts, click the person who sounds bad: their panel says whether their packets are getting lost. Volumes over 100% no longer crackle in 1.7 or newer.
+
+**You keep dropping out of the room.** Since 1.8.1 Telsiz gets back in by itself (see [Changelog](#21-changelog)), but find the cause anyway. Open `connection.log` in the settings folder and look at the reason on each "dropped out" line:
+
+| Reason | What happened |
+|---|---|
+| Connection to the host was lost. | Nothing came from the room for 15 seconds: the server froze, or the network between you and it stopped. |
+| You are not in this room (the server may have restarted). | The room forgot you: the server restarted, or your router started using a new port for Telsiz. |
+| The host closed the room. | The server was stopped (an update, say) or the PC host stopped hosting. |
+
+If several people drop **at the same second**, the cause is what they share: the server or its network. On the server, right after a drop: `journalctl -u telsiz --since "30 min ago"` shows a restart or an error, and `sudo dmesg -T | tail` shows trouble with the machine itself. A ping logger running during a session (`ping -D -O 1.1.1.1` on the server, a ping to the server from your PC) shows whether the server froze or the network stopped. If one person keeps dropping on their own, it is their connection, often Wi Fi.
 
 **Choppy or robotic voice.** Usually the host's upload or someone's Wi Fi: the person's panel shows how much of their sound had to be rebuilt or guessed. A network cable fixes most of it.
 
@@ -343,7 +378,7 @@ Telsiz was built by someone who streams.
 
 ---
 
-## 15. Running and building from source
+## 16. Running and building from source
 
 ### Libraries
 
@@ -388,12 +423,12 @@ assets/, docs/        icon and the pictures in this README
 
 ---
 
-## 16. Releasing a new version
+## 17. Releasing a new version
 
 This is how a new version reaches everyone's Telsiz. The update check reads only **published, non pre-release** GitHub releases, compares their **tag** with the version inside the program, and downloads the asset named **`Telsiz.exe`** for exe users.
 
 1. In `telsiz.py`, raise **`APP_VERSION`**, for example from `"1.6"` to `"1.7"`. **It must match the tag in step 4.** (If a tag is ever higher than the program inside it, Telsiz installs it once and then skips that tag, rather than offering it every day.)
-2. Add the changes to the [Changelog](#20-changelog).
+2. Add the changes to the [Changelog](#21-changelog).
 3. Commit and push:
    ```
    git add -A
@@ -415,7 +450,7 @@ To test the updater itself against a real release: set `APP_VERSION` in a local 
 
 ---
 
-## 17. How it works inside
+## 18. How it works inside
 
 ```mermaid
 flowchart LR
@@ -432,7 +467,8 @@ flowchart LR
 
 * **Audio, sending.** PortAudio (through `sounddevice`) records 20 ms frames at 48 kHz. Noise reduction runs on every frame (a Wiener filter whose noise estimate is learned while the voice gate is shut). Voice activity or push to talk decides whether a frame is sent; the first frame fades in and one faded out frame follows the last, so starting and stopping never clicks. A peak limiter keeps the signal under full scale. Opus encodes it at 48 kbit/s with in band error correction, by calling libopus directly (the copy inside PyAV's packages), and it goes out over UDP.
 * **Audio, receiving.** Each person gets an adaptive jitter buffer (40 to 120 ms) that puts packets back in order. A packet still missing when its turn comes is rebuilt from the error correction data in the next packet, or concealed by Opus. Everyone is mixed with their own volume, the output volume is applied, and a second limiter keeps the mix clean before it reaches your headphones.
-* **The room.** Whoever holds the room, a PC that hosts or a Telsiz server, relays each speaker's packets to the others in the same room without decoding them. The protocol is plain UDP: join, welcome, voice, ping, roster, and messages for rooms, statuses, kicks and screen sharing. Join requests are padded to 256 bytes so a reply is never larger than the request, which keeps the server from being used to amplify floods.
+* **The room.** Whoever holds the room, a PC that hosts or a Telsiz server, relays each speaker's packets to the others in the same room without decoding them. The protocol is plain UDP: join, welcome, voice, ping, roster, and messages for rooms, statuses, kicks and screen sharing. Join requests are padded to 256 bytes so a reply is never larger than the request, which keeps the server from being used to amplify floods. When a connection drops for a reason that can pass, the app joins again by itself, asking for the room it was in.
+* **Text chat.** The room (server or host) numbers each message, appends it to a JSON lines file per room and sends it to everyone in the room. Senders repeat a message until it is confirmed (with one message on its way at a time, so order holds), the room ignores copies, and every 2 seconds it tells each app the newest message number of its room, so apps fetch whatever they missed. Packets stay under 1400 bytes; a message is at most 1000 bytes of UTF-8.
 * **Screen sharing.** `mss` captures the screen, x264 encodes it for low latency, and pictures travel in pieces of about 1150 bytes. The server keeps recent pieces, so a viewer can ask for lost ones again, and a viewer can ask for a full picture at any time.
 * **The window** is a web page drawn by the system's web engine through pywebview. The page talks to `telsiz.py` over HTTP on `127.0.0.1` only, under a random key created at each start, and can only call a fixed list of actions. A web page in your normal browser, or another program, can't read Telsiz's state or press its buttons without that key.
 * **One copy at a time.** The running copy listens on `127.0.0.1:47571`; a second start asks it to show its window and quits.
@@ -440,20 +476,20 @@ flowchart LR
 
 ---
 
-## 18. Bandwidth and limits
+## 19. Bandwidth and limits
 
-**Bandwidth.** Each person who is talking costs about 50 to 55 kbit/s for every listener (Opus uses about 39 kbit/s on average at its 48 kbit/s setting; the rest is packet headers). Whoever holds the room sends that to everyone else, so a PC host's upload is the bottleneck: six people with two talking at once is roughly 0.5 Mbit/s up. Nobody sends anything while silent. Screen sharing costs at most 1.5 Mbit/s per viewer.
+**Bandwidth.** Each person who is talking costs about 50 to 55 kbit/s for every listener (Opus uses about 39 kbit/s on average at its 48 kbit/s setting; the rest is packet headers). Whoever holds the room sends that to everyone else, so a PC host's upload is the bottleneck: six people with two talking at once is roughly 0.5 Mbit/s up. Nobody sends anything while silent. Screen sharing costs at most 1.5 Mbit/s per viewer. Chat costs next to nothing: a message is a single small packet, plus a 20 byte note every 2 seconds.
 
 **Limits.**
 
 * **No encryption of its own.** Voice and video travel as plain UDP, and the room password is sent in plain text. The password keeps strangers out; it doesn't hide the audio. If that matters, use Tailscale or ZeroTier, which encrypt everything. Don't join as admin from public Wi Fi.
-* **No noise suppression or echo cancellation.** Use headphones, and keep keyboard noise below the sensitivity mark or use push to talk.
+* **No echo cancellation.** Use headphones. Noise reduction handles steady noise only, so keep keyboard noise below the sensitivity mark or use push to talk.
 * **IPv4 only.** Up to 15 guests on a PC host; a server takes 15 by default and up to 50 (`max_clients` in its settings file).
 * **The tray icon is Windows only.** On Linux and macOS, closing the window quits Telsiz.
 
 ---
 
-## 19. Credits and licences
+## 20. Credits and licences
 
 * **Telsiz** itself: MIT licence, © Emir Balkan. See [LICENSE](LICENSE).
 * **Fonts:** [Bricolage Grotesque](https://github.com/ateliertriay/bricolage) (© 2022 The Bricolage Grotesque Project Authors) and [Atkinson Hyperlegible Next](https://github.com/googlefonts/atkinson-hyperlegible-next) (© 2020 to 2024 The Atkinson Hyperlegible Next Project Authors), both under the SIL Open Font License 1.1. The full licence texts are in `ui/fonts`.
@@ -462,7 +498,23 @@ flowchart LR
 
 ---
 
-## 20. Changelog
+## 21. Changelog
+
+### 1.8.1 (November 2026)
+
+* **Gets back in by itself.** When the connection drops (nothing heard from the room for 15 seconds, a server restart, a router that changed Telsiz's port), Telsiz joins the same room again by itself, for up to a minute and a half. The room card says **Reconnecting** with the reason and a **Stop trying** button. Chat messages still on their way go out once it is back, never twice. A kick, a ban, a wrong password or a full room is never retried. Tested over a simulated line: back in within half a second of the line or the server coming back, and within a second after a port change. An outage shorter than 15 seconds never drops you; you only hear a gap.
+* **Survives short stalls.** Apps and the server wait 15 seconds of silence before they count a connection as lost, instead of 6. A VPS was measured stalling for 7 seconds at a time, which dropped everyone at once; now that is 7 seconds of silence and everyone stays in. (A 1.7 app still gives up after 6 seconds on its side.)
+* **connection.log** in the settings folder records every join, drop and return with the reason, and Audio settings show a **Connection** line with the count. No addresses are written.
+* Includes everything in 1.8. Server 1.5 already has the longer wait.
+
+### 1.8 (November 2026)
+
+* **Text chat, one per room.** **Chat** in the bottom bar opens it beside the room; the window grows sideways to make space and shrinks back when you close it (a window that is already wide just makes room; on a screen with no room the chat covers the window). Enter sends, Shift+Enter makes a new line. Links open in your browser. Your name in a message is highlighted. New messages show as a count on the Chat button and, while you aren't looking at the chat, as a short quiet sound you can switch off.
+* **History kept by the room:** a Telsiz server saves each room's chat in `/var/lib/telsiz/chat`, a PC host in its settings folder. Newcomers get the newest 100 messages and can fetch older ones. Deleting a room keeps its chat log under a "deleted" name.
+* **Delete messages:** your own, or anyone's as an admin or host.
+* **Messages arrive once and in order, even on a bad line.** Tested with 30% packet loss both ways plus duplicated and reordered packets.
+* **Push to talk doesn't fire while you type** in the message box, when your push to talk key is a letter.
+* Needs Telsiz server 1.5 for chat on a server (update it: see [Running a Telsiz server](#11-running-a-telsiz-server)). Everyone on 1.7 or older keeps talking normally with 1.8 and simply doesn't see the chat; a 1.8 app on an older server or host works as before, without chat.
 
 ### 1.7 (November 2026)
 

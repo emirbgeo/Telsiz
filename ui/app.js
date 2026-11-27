@@ -52,6 +52,8 @@
     shield: '<path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6l8-3z"/>',
     alert: '<path d="M12 3l10 18H2L12 3z"/><path d="M12 10v5M12 18v.5"/>',
     download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+    chat: '<path d="M5 5h14a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-8l-5 4v-4H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z"/>',
+    send: '<path d="M4 12l16-8-5 16-3-6-8-2z"/><path d="M12 14l8-10"/>',
   };
   const icon = (name) =>
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
@@ -164,10 +166,13 @@
   /* ----------------------------------------------------------- isolines */
 
   function drawIsolines() {
-    const svg = $('.isolines');
+    document.querySelectorAll('.isolines').forEach((svg, i) => drawSheet(svg, i));
+  }
+
+  function drawSheet(svg, sheet) {  // the chat's header is the next map sheet over
     const W = 400, H = 200, nx = 80, ny = 40;
     const today = new Date();
-    let seed = (today.getFullYear() * 10000 + (today.getMonth() + 1) * 100 + today.getDate()) % 2147483647;
+    let seed = (today.getFullYear() * 10000 + (today.getMonth() + 1) * 100 + today.getDate() + sheet * 7919) % 2147483647;
     const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
     const sources = Array.from({ length: 4 }, () => ({
       x: rnd() * W, y: rnd() * H * 1.2 - H * 0.1, a: (rnd() < 0.3 ? -1 : 1) * (0.6 + rnd()), s: 40 + rnd() * 70,
@@ -442,6 +447,14 @@
         ),
         h('div', { class: 'spot-actions' }, h('button', { class: 'btn', text: 'Stop hosting', onclick: connect }))
       );
+    } else if (c.state === 'reconnecting') {
+      heat = 'high';
+      kids.push(
+        h('div', { class: 'spot-label' }, h('span', { text: 'Reconnecting' }), h('span', { class: 'conn-info', text: c.info || '' })),
+        h('p', { class: 'spot-title', text: c.where ? 'Getting back into ' + c.where : 'Getting back in' }),
+        h('p', { class: 'hint', text: c.reason + ' Telsiz is trying to get back in by itself. You don’t need to do anything.' }),
+        h('div', { class: 'spot-actions' }, h('button', { class: 'btn', text: 'Stop trying', onclick: connect }))
+      );
     } else if (c.state !== 'connected') {
       heat = 'high';
       kids.push(
@@ -531,7 +544,7 @@
     if (!s.people) {
       put(box, h('p', { class: 'empty-list', text: s.conn.kind === 'none'
         ? 'Nobody here yet. Host a room or join one, and everyone in it shows up here, lighting up while they talk.'
-        : 'Waiting for the room…' }));
+        : s.conn.state === 'reconnecting' ? 'Everyone shows up here again once you are back in.' : 'Waiting for the room…' }));
       return;
     }
     const admin = s.conn.kind === 'client' && s.conn.admin;
@@ -668,6 +681,7 @@
   /* ------------------------------------------------------------------ dock */
 
   function renderDock() {
+    renderChatButton();
     const me = ui.s.me;
     const m = $('#btn-mute'), d = $('#btn-deaf');
     const mk = (me.muted ? 1 : 0) + ':' + (ui.s.meter.tx ? 1 : 0);
@@ -769,8 +783,12 @@
       setting('Hear myself (mic test)', sw(a.loopback, (v) => api('set_loopback', { on: v }), 'Hear myself')),
       setting('Push to talk sounds', sw(a.chimes, (v) => api('set_chimes', { on: v }), 'Push to talk sounds'),
         'A rising chime when you go on air and a falling one when you let go. Only you hear them.'),
+      setting('Message sound', sw(s.chat.sound, (v) => api('set_chat_sound', { on: v }), 'Message sound'),
+        'A short, quiet sound when a chat message arrives while you aren’t looking at the chat. Deafen silences it too.'),
       h('div', { class: 'setting' }, h('div', { class: 'name', text: 'Sound check' }),
         h('div', { class: 'desc', id: 'snd-check', text: a.check })),
+      h('div', { class: 'setting' }, h('div', { class: 'name', text: 'Connection' }),
+        h('div', { class: 'desc', id: 'conn-check', text: a.conn_check })),
 
       h('h3', { text: 'Updates' }),
       setting('Check for updates', sw(s.update.auto, (v) => api('update_auto', { on: v }), 'Check for updates'),
@@ -807,6 +825,8 @@
     }
     const chk = $('#snd-check');
     if (chk && chk.textContent !== s.audio.check) chk.textContent = s.audio.check;
+    const cc = $('#conn-check');
+    if (cc && cc.textContent !== s.audio.conn_check) cc.textContent = s.audio.conn_check;
     const err = $('#audio-err');
     if (err) {
       err.hidden = !s.audio.error;
@@ -1013,6 +1033,310 @@
     return 'You have Telsiz ' + u.version + '.';
   }
 
+
+  /* ----------------------------------------------------------------- chat */
+
+  const CHAT_W = 340, SIDE_BY_SIDE = 720;   // the panel's width; below this window width it covers the window
+  const MAX_CHARS = 500, MAX_BYTES = 1000;
+  const chat = { open: false, ready: false, key: '', ver: '', limit: 200, fetching: false, again: false,
+    sending: false, lastId: 0, where: '', me: '', why: '', inited: false };
+  const enc = new TextEncoder();
+  const narrow = () => window.innerWidth < SIDE_BY_SIDE;
+  const hasFocus = () => document.hasFocus() && !document.hidden;
+
+  function renderChatButton() {
+    const b = $('#btn-chat');
+    const n = ui.s && !chat.open ? ui.s.chat.unread : 0;
+    const k = (chat.open ? 1 : 0) + ':' + n;
+    if (b.dataset.t === k) return;
+    b.dataset.t = k;
+    put(b, h('span', { class: 'ico', html: icon('chat') }, h('b', { class: 'badge', text: n ? (n > 99 ? '99+' : String(n)) : '' })), 'Chat');
+    b.classList.toggle('on', chat.open);
+    b.setAttribute('aria-pressed', String(chat.open));
+    b.setAttribute('aria-label', n ? 'Chat, ' + n + ' new' : 'Chat');
+  }
+
+  /** Which way the window can grow on the screen to make room: 'right', 'left', or '' (it covers instead). */
+  function growSide() {
+    if (!narrow() || (ui.s && ui.s.app.browser)) return '';
+    const left0 = screen.availLeft || 0;
+    const right = left0 + screen.availWidth - (window.screenX + window.outerWidth);
+    const left = window.screenX - left0;
+    if (right >= CHAT_W) return 'right';
+    if (left >= CHAT_W) return 'left';
+    return screen.availWidth >= window.outerWidth + CHAT_W ? (right >= left ? 'right' : 'left') : '';
+  }
+
+  function chatOpen(open, quiet) {
+    if (open === chat.open) return;
+    chat.open = open;
+    document.body.classList.toggle('chat-open', open);
+    $('#chat').hidden = !open;
+    renderChatButton();
+    if (!quiet) api('chat_view', { open, grow: open ? growSide() : '', focused: hasFocus() });
+    if (open) {
+      chat.ver = '';
+      applyChat(true);
+      setTimeout(() => { const t = $('#chat-input'); if (!t.disabled && hasFocus()) t.focus(); }, 40);
+    } else if (document.activeElement && $('#chat').contains(document.activeElement)) {
+      $('#btn-chat').focus();
+    }
+  }
+
+  function applyChat(force) {
+    const s = ui.s;
+    if (!s) return;
+    const c = s.chat;
+    if (!chat.inited) { chat.inited = true; if (c.open) chatOpen(true, true); }
+    renderChatButton();
+    if (!chat.open) return;
+    const where = $('#chat-where');
+    const w = c.ok ? c.where : '';
+    if (where.textContent !== w) where.textContent = w;
+    const note = $('#chat-note');
+    note.hidden = !c.note;
+    if (note.textContent !== c.note) note.textContent = c.note;
+    const ta = $('#chat-input');
+    if (ta.disabled === c.ok) {
+      ta.disabled = !c.ok;
+      $('#chat-send').disabled = !c.ok;
+      ta.placeholder = c.ok ? 'Message ' + c.where : 'Chat is off';
+    } else if (c.ok && ta.placeholder !== 'Message ' + c.where) ta.placeholder = 'Message ' + c.where;
+    if (chat.ready !== c.ok) { chat.ready = c.ok; composerCheck(); }
+    chat.where = c.where;
+    if (c.version === chat.ver && !force) return;
+    chat.ver = c.version;
+    if (c.ok) fetchChat();
+    else {
+      chat.key = '';
+      chat.why = c.why;
+      put($('#chat-log'), h('p', { class: 'chat-empty', text: c.why }));
+      $('#chat-jump').hidden = true;
+    }
+  }
+
+  async function fetchChat(toBottom) {
+    if (chat.fetching) { chat.again = chat.again || toBottom || 'yes'; return; }
+    chat.fetching = true;
+    let r = null;
+    try { r = await api('chat_log', { limit: chat.limit }); } finally { chat.fetching = false; }
+    if (r && !r.error && chat.open) renderChatLog(r, !!toBottom);
+    if (chat.again) { const b = chat.again === true; chat.again = false; fetchChat(b); }
+  }
+
+  function selectingInLog() {
+    const sel = window.getSelection();
+    return sel && !sel.isCollapsed && sel.rangeCount && $('#chat-log').contains(sel.getRangeAt(0).commonAncestorContainer);
+  }
+
+  function renderChatLog(r, toBottom) {
+    const log = $('#chat-log');
+    if (selectingInLog()) { setTimeout(() => fetchChat(toBottom), 800); return; }  // don't pull text out from under a selection
+    if (r.key !== chat.key) { chat.key = r.key; chat.limit = 200; chat.lastId = 0; toBottom = true; }
+    chat.me = r.me || '';
+    const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 48;
+    let anchor = null, anchorTop = 0;
+    if (!nearBottom && !toBottom) {
+      for (const el of log.querySelectorAll('.msg[data-id]')) {
+        if (el.offsetTop + el.offsetHeight > log.scrollTop) { anchor = el.dataset.id; anchorTop = el.offsetTop - log.scrollTop; break; }
+      }
+    }
+    const nodes = [];
+    if (r.older) nodes.push(h('button', { class: 'btn small ghost chat-older', type: 'button', text: 'Show older messages', onclick: chatOlder }));
+    if (!r.messages.length && !r.pending.length) {
+      nodes.push(h('p', { class: 'chat-empty', text: r.loading ? 'Loading the chat…' : 'No messages yet. Say hello to ' + (chat.where || 'the room') + '.' }));
+    }
+    let day = '', prev = null;
+    for (const m of r.messages) {
+      const d = new Date(m.t * 1000);
+      if (d.toDateString() !== day) {
+        day = d.toDateString();
+        nodes.push(h('div', { class: 'chat-day', role: 'separator', text: dayLabel(d) }));
+        prev = null;
+      }
+      const cont = !!prev && prev.name === m.name && m.t - prev.t < 300 && !prev.deleted && !m.deleted;
+      nodes.push(msgEl(m, cont));
+      prev = m;
+    }
+    for (const pm of r.pending) nodes.push(pendingEl(pm));
+    put(log, ...nodes);
+    const newest = r.messages.length ? r.messages[r.messages.length - 1] : null;
+    const fresh = newest && chat.lastId && newest.id > chat.lastId && !newest.mine;
+    chat.lastId = newest ? newest.id : 0;
+    if (toBottom || nearBottom) { log.scrollTop = log.scrollHeight; $('#chat-jump').hidden = true; }
+    else {
+      if (anchor) {
+        const el = log.querySelector('.msg[data-id="' + anchor + '"]');
+        if (el) log.scrollTop = el.offsetTop - anchorTop;
+      }
+      if (fresh) $('#chat-jump').hidden = false;
+    }
+  }
+
+  const DAY_FMT = { weekday: 'short', day: 'numeric', month: 'short' };
+  function dayLabel(d) {
+    const today = new Date();
+    const y = new Date(today); y.setDate(today.getDate() - 1);
+    if (d.toDateString() === today.toDateString()) return 'Today';
+    if (d.toDateString() === y.toDateString()) return 'Yesterday';
+    return d.toLocaleDateString('en-GB', d.getFullYear() === today.getFullYear() ? DAY_FMT : Object.assign({ year: 'numeric' }, DAY_FMT));
+  }
+  const hhmm = (d) => d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+
+  const WHO = ['var(--normal)', 'var(--low-text)', 'var(--lime)', 'var(--high)', 'var(--violet)', 'var(--orchid)'];
+  function whoColor(name) {  // the same name gets the same colour on every PC
+    let x = 2166136261;
+    for (const ch of name) { x ^= ch.codePointAt(0); x = Math.imul(x, 16777619) >>> 0; }
+    x ^= x >>> 15; x = Math.imul(x, 0x2c1b3c6d) >>> 0;  // FNV alone spreads short names poorly over 6 colours
+    x ^= x >>> 12; x = Math.imul(x, 0x297a2d39) >>> 0;
+    x ^= x >>> 15;
+    return WHO[(x >>> 0) % WHO.length];
+  }
+
+  function mentions(text, me) {
+    if (!me || me.length < 2) return false;
+    const esc = me.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    try { return new RegExp('(^|[^\\p{L}\\p{N}_])@?' + esc + '(?![\\p{L}\\p{N}_])', 'iu').test(text); } catch (e) { return false; }
+  }
+
+  const URL_RE = /\bhttps?:\/\/[^\s<>"'`]+/gi;
+  function linkify(text) {
+    const frag = document.createDocumentFragment();
+    let last = 0;
+    for (const m of text.matchAll(URL_RE)) {
+      let url = m[0];
+      for (;;) {  // sentence punctuation after a link is not part of it
+        const c = url.slice(-1);
+        if ('.,;:!?\'"»'.includes(c)) url = url.slice(0, -1);
+        else if (c === ')' && (url.match(/\(/g) || []).length < (url.match(/\)/g) || []).length) url = url.slice(0, -1);
+        else break;
+      }
+      if (url.length < 10) continue;
+      frag.append(text.slice(last, m.index));
+      // a span, not <a href>: nothing can ever open inside the Telsiz window itself
+      frag.append(h('span', { class: 'link', role: 'link', tabindex: '0', title: 'Open in your browser', text: url,
+        onclick: () => openLink(url), onkeydown: (e) => { if (e.key === 'Enter') openLink(url); } }));
+      last = m.index + url.length;
+    }
+    frag.append(text.slice(last));
+    return frag;
+  }
+
+  async function openLink(url) {
+    const r = await api('open_link', { url });
+    if (r.error) toast(r.error);
+  }
+
+  function msgEl(m, cont) {
+    const cls = ['msg'];
+    if (cont) cls.push('cont');
+    if (m.mine) cls.push('mine');
+    if (m.deleted) cls.push('deleted');
+    if (!m.mine && !m.deleted && mentions(m.text, chat.me)) cls.push('mention');
+    const d = new Date(m.t * 1000);
+    const full = d.toLocaleString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    return h('div', { class: cls.join(' '), 'data-id': String(m.id), title: cont ? full : null },
+      cont ? null : h('div', { class: 'm-head' },
+        h('span', { class: 'm-name', style: '--who:' + whoColor(m.name), text: m.name }),
+        h('time', { datetime: d.toISOString(), title: full, text: hhmm(d) })),
+      h('div', { class: 'm-text' }, m.deleted ? h('i', { text: 'Message deleted' }) : linkify(m.text)),
+      m.can_delete ? h('button', { class: 'icon-btn m-del', type: 'button', html: icon('trash'), title: 'Delete message', 'aria-label': 'Delete message', onclick: () => deleteMsg(m) }) : null);
+  }
+
+  function pendingEl(p) {
+    const failed = p.state === 'failed';
+    return h('div', { class: 'msg mine pending' + (failed ? ' failed' : '') },
+      h('div', { class: 'm-head' },
+        h('span', { class: 'm-name', style: '--who:' + whoColor(chat.me), text: chat.me }),
+        h('span', { class: 'm-state', text: failed ? 'Not sent' : p.slow ? 'Waiting, sending too fast…' : 'Sending…' })),
+      h('div', { class: 'm-text' }, linkify(p.text)),
+      failed ? h('div', { class: 'm-fail' }, h('span', { text: p.error }),
+        h('button', { class: 'btn small', type: 'button', text: 'Try again', onclick: () => chatCall('chat_retry', { cid: p.cid }) }),
+        h('button', { class: 'btn small ghost', type: 'button', text: 'Remove', onclick: () => chatCall('chat_discard', { cid: p.cid }) })) : null);
+  }
+
+  async function chatCall(name, args) {
+    const r = await api(name, args);
+    if (r.error) toast(r.error);
+    fetchChat();
+  }
+
+  async function deleteMsg(m) {
+    const ok = await confirmBox({ title: 'Delete this message?', body: m.mine ? 'It disappears for everyone in the room.' : 'You are an admin here: it disappears for everyone in the room.', yes: 'Delete' });
+    if (ok) chatCall('chat_delete', { mid: m.id });
+  }
+
+  function chatOlder() {
+    chat.limit = Math.min(1000, chat.limit + 50);
+    api('chat_older').then(() => fetchChat());
+  }
+
+  function chatHint(text, kind) {
+    const el = $('#chat-hint');
+    el.className = 'chat-hint' + (kind ? ' ' + kind : '');
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  function composerCheck() {
+    const ta = $('#chat-input');
+    const n = ta.value.length, b = enc.encode(ta.value).length;
+    let over = false;
+    if (b > MAX_BYTES) { chatHint('Too long to send: shorten it a little.', 'err'); over = true; }
+    else if (n > MAX_CHARS - 80 || b > MAX_BYTES - 120) chatHint(Math.min(MAX_CHARS - n, Math.floor((MAX_BYTES - b) / 2)) + ' characters left.', 'warn');
+    else chatHint(chat.ready ? 'Enter sends, Shift+Enter starts a new line.' : '');
+    $('#chat-send').disabled = !chat.ready || over || !ta.value.trim();
+    return !over;
+  }
+
+  function autoGrow() {
+    const ta = $('#chat-input');
+    ta.style.height = '40px';
+    ta.style.height = Math.min(140, ta.scrollHeight + 2) + 'px';
+  }
+
+  async function sendChat() {
+    const ta = $('#chat-input');
+    const text = ta.value;
+    if (!text.trim() || chat.sending || !composerCheck()) return;
+    chat.sending = true;
+    const r = await api('chat_send', { text });
+    chat.sending = false;
+    if (r.error) { chatHint(r.error, 'err'); return; }
+    if (ta.value === text) ta.value = '';
+    autoGrow();
+    composerCheck();
+    fetchChat(true);
+  }
+
+  function initChat() {
+    const ta = $('#chat-input');
+    $('#chat-close').innerHTML = icon('close');
+    $('#chat-send').innerHTML = icon('send');
+    $('#chat-close').addEventListener('click', () => chatOpen(false));
+    $('#btn-chat').addEventListener('click', () => chatOpen(!chat.open));
+    $('#chat-compose').addEventListener('submit', (e) => { e.preventDefault(); sendChat(); });
+    ta.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); if (narrow()) chatOpen(false); else ta.blur(); }
+    });
+    ta.addEventListener('input', () => { autoGrow(); composerCheck(); });
+    // while you type here, a push to talk key that types letters doesn't put you on air
+    ta.addEventListener('focus', () => api('chat_view', { typing: true }));
+    ta.addEventListener('blur', () => api('chat_view', { typing: false }));
+    setInterval(() => { if (document.activeElement === ta && hasFocus()) api('chat_view', { typing: true }); }, 1000);
+    const log = $('#chat-log');
+    log.addEventListener('scroll', () => {
+      if (log.scrollHeight - log.scrollTop - log.clientHeight < 48) $('#chat-jump').hidden = true;
+    });
+    $('#chat-jump').addEventListener('click', () => { log.scrollTop = log.scrollHeight; $('#chat-jump').hidden = true; });
+    const focus = () => api('chat_view', { focused: hasFocus() });
+    window.addEventListener('focus', focus);
+    window.addEventListener('blur', focus);
+    document.addEventListener('visibilitychange', focus);
+    focus();
+    composerCheck();
+  }
+
   /* ----------------------------------------------------------------- poll */
 
   let polling = false;
@@ -1052,6 +1376,7 @@
     renderDock();
     if (ui.audioOpen) renderAudio(false);
     if (ui.bansOpen && ui.bansCount !== s.bans) renderBans();
+    applyChat(false);
 
     const err = s.audio.error;
     const hasCard = !!$('#notices [data-kind="audio"]');
@@ -1090,12 +1415,15 @@
   $('#btn-hide').addEventListener('click', () => api('hide_window'));
   $('#btn-mute').addEventListener('click', () => act('toggle_mute'));
   $('#btn-deaf').addEventListener('click', () => act('toggle_deafen'));
+  initChat();
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || ui.modalOpen) return;
-    if (ui.audioOpen) closeAudio();
+    if (chat.open && narrow() && $('#chat').contains(document.activeElement)) chatOpen(false);
+    else if (ui.audioOpen) closeAudio();
     else if (ui.bansOpen) closeBans();
     else if (ui.openPerson !== null) { ui.openPerson = null; ui.peopleSig = ''; renderPeople(); }
+    else if (chat.open && narrow()) chatOpen(false);
   });
-  document.addEventListener('contextmenu', (e) => { if (!e.target.closest('input, textarea, .a-body, .title small')) e.preventDefault(); });
+  document.addEventListener('contextmenu', (e) => { if (!e.target.closest('input, textarea, .a-body, .title small, .chat-log')) e.preventDefault(); });
   poll(false);
 })();

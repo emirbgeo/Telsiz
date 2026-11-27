@@ -8,7 +8,8 @@ so it needs no sound card, no window and nothing beyond Python's standard librar
 
 Since 1.3 the server has rooms (you only hear people in your own room; admins
 create and delete rooms) and relays screen sharing (one sharer per room, sent
-only to the people who chose to watch).
+only to the people who chose to watch). Since 1.5 every room has a text chat;
+its messages are saved in the chat folder next to the settings file.
 
     python3 telsiz_server.py --init       create telsiz_server.json with new passwords
     python3 telsiz_server.py              run the server
@@ -33,7 +34,7 @@ import threading
 import time
 from pathlib import Path
 
-SERVER_VERSION = "1.4"
+SERVER_VERSION = "1.5"
 PROTOCOL = 2          # same wire protocol as the Telsiz 1.1+ apps; new features are negotiated
 DEFAULT_PORT = 50505
 MAX_NAME = 32
@@ -41,7 +42,7 @@ MAX_ROOM_NAME = 24
 MAX_ROOMS = 25
 LOBBY_ID = 1
 HELLO_MIN = 256
-TIMEOUT = 6.0
+TIMEOUT = 15.0        # silence before someone counts as gone (a VPS stalling for 7 s must not drop everyone)
 ROSTER_EVERY = 2.0
 BANS_IN_PACKET = 20
 LOCKOUT_FAILS = 10    # wrong passwords from one IP within LOCKOUT_WINDOW ...
@@ -84,6 +85,377 @@ def _write_json(path: Path, data):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
     os.replace(tmp, path)
+
+
+# ---- chat core: the same code in telsiz.py and server/telsiz_server.py ----
+# Text chat (apps 1.8+, server 1.5+). One chat per room. The server (or the PC
+# that hosts) numbers every message, keeps the last CHAT_KEEP of each room in
+# memory and appends every message to a JSON lines file per room. Apps send a
+# message again until it is acknowledged (the server ignores the copies), and
+# fetch whatever they missed: every ROSTER_EVERY seconds the server tells each
+# app the newest message number of its room.
+T_CHAT_SEND, T_CHAT_MSGS, T_CHAT_ACK, T_CHAT_GET, T_CHAT_HEAD, T_CHAT_DEL = range(21, 27)
+C_CHAT, F_CHAT = 4, 8          # capability bit in the join request, flag in the welcome
+CHAT_MAX_CHARS = 500
+CHAT_MAX_BYTES = 1000          # UTF-8; a message always fits in one packet
+CHAT_MAX_LINES = 15
+CHAT_KEEP = 1000               # messages per room kept in memory and offered as history
+CHAT_JOIN = 100                # sent to someone who arrives; older ones when they ask
+CHAT_PAGE = 50                 # older messages per request
+CHAT_REVS_MAX = 25             # deletions per answer
+CHAT_FILE_MAX = 8 << 20        # a log file this big is archived next to it and a new one started
+CHAT_PACKET = 1300
+CHAT_BURST, CHAT_RATE = 8, 1.0  # messages: 8 in a row, then one a second
+CHAT_GETS_PER_SEC = 10
+CHAT_GET_BYTES = 256_000       # history sent to one person per 10 s at most: a small question can never
+                               # be turned into a flood aimed at someone else's address
+ACK_OK, ACK_SLOW, ACK_BAD, ACK_ROOM = 0, 1, 2, 3
+GET_AFTER, GET_BEFORE, GET_REVS = 0, 1, 2
+MSG_LIVE, MSG_REVS = 1, 2      # T_CHAT_MSGS: just posted (or deleted); carries deletions up to its rev
+M_DELETED = 1                  # per message
+
+# control characters (except newline) and the bidirectional overrides that can make text read backwards
+_CHAT_DROP = dict.fromkeys([*range(0, 9), 11, 12, *range(14, 32), 127, *range(0x80, 0xA0),
+                            *range(0x202A, 0x202F), *range(0x2066, 0x206A)])
+
+
+def clean_chat(text: str) -> str:
+    """What is left of a message after removing what has no business in chat."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").translate(_CHAT_DROP)
+    lines, blank = [], 0
+    for line in text.split("\n"):
+        line = line.rstrip()
+        blank = blank + 1 if not line else 0
+        if blank < 2:                          # at most one empty line in a row
+            lines.append(line)
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if len(lines) > CHAT_MAX_LINES:            # a wall of short lines: the rest goes on the last line
+        lines = lines[:CHAT_MAX_LINES - 1] + [" ".join(x for x in lines[CHAT_MAX_LINES - 1:] if x)]
+    return "\n".join(lines).strip()
+
+
+def chat_entry(m: dict) -> bytes:
+    tb = m["text"].encode("utf-8")[:CHAT_MAX_BYTES]
+    return (struct.pack("!IIHB", m["id"], m["t"] & 0xFFFFFFFF, m["uid"] & 0xFFFF, m["flags"])
+            + _pstr(m["name"]) + struct.pack("!H", len(tb)) + tb)
+
+
+def parse_chat_msgs(data: bytes):
+    """T_CHAT_MSGS -> (room, epoch, rev, flags, [messages])."""
+    room, epoch, rev, flags, n = struct.unpack_from("!HIIBB", data, 1)
+    off, out = 13, []
+    for _ in range(n):
+        mid, t, uid, mflags = struct.unpack_from("!IIHB", data, off)
+        name, off = _ustr(data, off + 11)
+        (ln,) = struct.unpack_from("!H", data, off)
+        if off + 2 + ln > len(data):
+            raise ValueError("truncated message")
+        text = data[off + 2:off + 2 + ln].decode("utf-8", "replace")
+        off += 2 + ln
+        out.append({"id": mid, "t": t, "uid": uid, "flags": mflags, "name": name, "text": text})
+    return room, epoch, rev, flags, out
+
+
+class ChatLog:
+    """One room's chat: the recent messages in memory, every message appended to a file.
+
+    The file is JSON lines: a header line {"telsiz_chat": 1, "epoch": ...}, then one
+    line per message, and {"del": id} lines for deleted ones. The epoch is a random
+    number that changes when a room's chat starts over (a new room with an old
+    number, a log deleted by hand), so apps know to forget what they had.
+    """
+
+    def __init__(self, path, room: int, log=None):
+        self.path, self.room = path, room
+        self.log = log or (lambda msg: None)
+        self.msgs: collections.deque = collections.deque(maxlen=CHAT_KEEP)
+        self.epoch, self.next_id, self.rev = 0, 1, 0
+        self.revs: collections.deque = collections.deque(maxlen=CHAT_KEEP)  # (rev, id) of deletions
+        self._header_written = False
+        self._warned_at = -1e9
+        self._load()
+        if not self.epoch:
+            self.epoch = secrets.randbits(32) or 1
+
+    # ---- the file ----
+    def _load(self):
+        if self.path is None:
+            return
+        try:
+            f = open(self.path, encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            self.log(f"warning: could not read the chat log {self.path}: {e}")
+            return
+        byid = {}
+        with f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue                    # a line cut short by a crash
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    if "telsiz_chat" in d:
+                        if not self.epoch:
+                            self.epoch = int(d.get("epoch", 0)) & 0xFFFFFFFF
+                            self._header_written = bool(self.epoch)
+                        self.next_id = max(self.next_id, int(d.get("next_id", 1)))
+                        self.rev = max(self.rev, int(d.get("rev", 0)))
+                    elif "del" in d:
+                        self.rev += 1                # every deletion counts, also of messages no longer kept
+                        m = byid.get(int(d["del"]))
+                        if m is not None and not m["flags"] & M_DELETED:
+                            m["flags"] |= M_DELETED
+                            m["text"] = ""
+                            self.revs.append((self.rev, m["id"]))
+                    elif isinstance(d.get("text"), str) and isinstance(d.get("name"), str):
+                        mid = int(d["id"])
+                        if not 0 < mid <= 0xFFFFFFFF:
+                            continue
+                        m = {"id": mid, "t": int(d.get("t", 0)), "uid": int(d.get("uid", 0)) & 0xFFFF,
+                             "name": d["name"][:MAX_NAME], "text": d["text"][:CHAT_MAX_CHARS], "flags": 0,
+                             "dev": str(d.get("dev", ""))[:32]}
+                        if len(self.msgs) == CHAT_KEEP:
+                            byid.pop(self.msgs[0]["id"], None)
+                        self.msgs.append(m)
+                        byid[mid] = m
+                        self.next_id = max(self.next_id, mid + 1)
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+    def _append(self, obj: dict):
+        if self.path is None:
+            return
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            new = not self.path.exists()
+            if new or not self._header_written:
+                line = json.dumps({"telsiz_chat": 1, "room": self.room, "epoch": self.epoch,
+                                   "next_id": self.next_id - (1 if "id" in obj else 0), "rev": self.rev}) + "\n" + line
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line)
+                size = f.tell()
+            if new:
+                try:
+                    os.chmod(self.path, 0o600)      # private conversations
+                except OSError:
+                    pass
+            self._header_written = True
+            if size > CHAT_FILE_MAX:
+                self._rotate()
+        except OSError as e:
+            now = time.monotonic()
+            if now - self._warned_at > 600:
+                self._warned_at = now
+                self.log(f"warning: chat is working, but could not be saved to {self.path}: {e}")
+
+    def _rotate(self):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        os.replace(self.path, self.path.with_name(f"{self.path.stem}.{stamp}{self.path.suffix}"))
+        self._header_written = False   # the next message starts a new file with the same epoch and numbers
+
+    def archive(self, why: str = "deleted"):
+        """The room is gone: keep its log under another name, so a new room with this number starts clean."""
+        if self.path is None or not self.path.exists():
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            os.replace(self.path, self.path.with_name(f"{self.path.stem}.{why}-{stamp}{self.path.suffix}"))
+        except OSError as e:
+            self.log(f"warning: could not archive the chat log {self.path}: {e}")
+
+    # ---- messages ----
+    @property
+    def first(self) -> int:
+        return self.msgs[0]["id"] if self.msgs else self.next_id
+
+    @property
+    def last(self) -> int:
+        return self.next_id - 1
+
+    def post(self, uid: int, name: str, text: str, dev: str = "") -> dict:
+        m = {"id": self.next_id, "t": int(time.time()), "uid": uid, "name": name, "text": text,
+             "flags": 0, "dev": dev}
+        self.next_id += 1
+        self.msgs.append(m)
+        self._append({"id": m["id"], "t": m["t"], "uid": uid, "name": name, "text": text, "dev": dev})
+        return m
+
+    def get(self, mid: int):
+        for m in reversed(self.msgs):
+            if m["id"] == mid:
+                return m
+            if m["id"] < mid:
+                break
+        return None
+
+    def delete(self, mid: int, by: str):
+        m = self.get(mid)
+        if m is None or m["flags"] & M_DELETED:
+            return None
+        m["flags"] |= M_DELETED
+        m["text"] = ""
+        self.rev += 1
+        self.revs.append((self.rev, mid))
+        self._append({"del": mid, "by": by, "t": int(time.time())})
+        return m
+
+    def after(self, mid: int, limit: int = CHAT_JOIN) -> list:
+        out = [m for m in self.msgs if m["id"] > mid]
+        return out[-limit:]
+
+    def before(self, mid: int, limit: int = CHAT_PAGE) -> list:
+        return [m for m in self.msgs if m["id"] < mid][-limit:]
+
+    def deletions_since(self, rev: int):
+        """Up to CHAT_REVS_MAX deleted messages after `rev`, and the rev an app is at once it has them."""
+        picked = [(r, i) for r, i in self.revs if r > rev][:CHAT_REVS_MAX]
+        if not picked:
+            return [], self.rev
+        msgs = [m for m in (self.get(i) for _, i in picked) if m is not None]
+        return msgs, (picked[-1][0] if len(picked) == CHAT_REVS_MAX else self.rev)
+
+    # ---- packets ----
+    def head_packet(self, deaf: int) -> bytes:
+        return struct.pack("!BHIIIIB", T_CHAT_HEAD, self.room, self.epoch, self.first, self.last, self.rev,
+                           min(deaf, 255))
+
+    def packets(self, msgs, flags: int = 0, rev=None) -> list:
+        head = struct.pack("!BHIIB", T_CHAT_MSGS, self.room, self.epoch, self.rev if rev is None else rev, flags)
+        out, body, n = [], b"", 0
+        for m in msgs:
+            e = chat_entry(m)
+            if n and (len(head) + 1 + len(body) + len(e) > CHAT_PACKET or n == 255):
+                out.append(head + bytes([n]) + body)
+                body, n = b"", 0
+            body += e
+            n += 1
+        if n or not out:  # an empty answer still says "that is all"
+            out.append(head + bytes([n]) + body)
+        return out
+
+
+class _Bucket:
+    __slots__ = ("level", "at")
+
+    def __init__(self, cap: float, now: float):
+        self.level, self.at = cap, now
+
+    def take(self, cap: float, rate: float, now: float) -> bool:
+        self.level = min(cap, self.level + (now - self.at) * rate)
+        self.at = now
+        if self.level >= 1.0:
+            self.level -= 1.0
+            return True
+        return False
+
+
+class ChatDesk:
+    """The chat of a server or a hosting PC: a ChatLog per room, limits, and the answers to apps.
+
+    The caller decides who may do what (which room someone is in, whether they are
+    an admin) and delivers the packets these methods return.
+    """
+
+    def __init__(self, folder, log=None):
+        self.folder = folder
+        self.log = log or (lambda msg: None)
+        self.logs: dict[int, ChatLog] = {}
+        self._seen: dict[str, collections.OrderedDict] = {}   # who -> message number they chose -> answer
+        self._buckets: dict[str, _Bucket] = {}
+        self._gets: dict[str, list] = {}
+
+    def room(self, rid: int) -> ChatLog:
+        cl = self.logs.get(rid)
+        if cl is None:
+            path = self.folder / f"room-{rid}.jsonl" if self.folder is not None else None
+            cl = self.logs[rid] = ChatLog(path, rid, self.log)
+        return cl
+
+    def drop_room(self, rid: int):
+        self.room(rid).archive()
+        self.logs.pop(rid, None)
+
+    def _tidy(self):
+        for d in (self._seen, self._buckets, self._gets):
+            if len(d) > 4096:
+                d.clear()
+
+    def send(self, data: bytes, who: str, uid: int, name: str, dev: str, room: int, now: float):
+        """T_CHAT_SEND -> (acknowledgement, packets for everyone in the room or None)."""
+        want_room, cid, n = struct.unpack_from("!HIH", data, 1)
+        raw = data[9:9 + n]
+        if len(raw) != n:
+            return None, None
+        self._tidy()
+        seen = self._seen.setdefault(who, collections.OrderedDict())
+        if cid in seen:                         # a copy sent again because our answer got lost
+            r, mid = seen[cid]
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_OK, r, mid), None
+        if want_room != room:
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_ROOM, want_room, 0), None
+        text = clean_chat(raw.decode("utf-8", "replace"))
+        if not text or n > CHAT_MAX_BYTES or len(text) > CHAT_MAX_CHARS:
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_BAD, room, 0), None
+        bucket = self._buckets.get(who)
+        if bucket is None:
+            bucket = self._buckets[who] = _Bucket(CHAT_BURST, now)
+        if not bucket.take(CHAT_BURST, CHAT_RATE, now):
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_SLOW, room, 0), None
+        cl = self.room(room)
+        m = cl.post(uid, name, text, dev)
+        seen[cid] = (room, m["id"])
+        while len(seen) > 64:
+            seen.popitem(last=False)
+        return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_OK, room, m["id"]), cl.packets([m], MSG_LIVE)
+
+    def get(self, data: bytes, who: str, room: int, now: float) -> list:
+        """T_CHAT_GET -> the packets that answer it (only about the asker's own room)."""
+        rid, mode, ref = struct.unpack_from("!HBI", data, 1)
+        if rid != room:
+            return []
+        self._tidy()
+        g = self._gets.setdefault(who, [now, 0, now, 0])  # questions this second, bytes these 10 s
+        if now - g[0] >= 1.0:
+            g[0], g[1] = now, 0
+        if now - g[2] >= 10.0:
+            g[2], g[3] = now, 0
+        if g[1] >= CHAT_GETS_PER_SEC or g[3] >= CHAT_GET_BYTES:
+            return []
+        g[1] += 1
+        cl = self.room(room)
+        if mode == GET_AFTER:
+            out = cl.packets(cl.after(ref, CHAT_JOIN))
+        elif mode == GET_BEFORE:
+            out = cl.packets(cl.before(ref, CHAT_PAGE))
+        elif mode == GET_REVS:
+            msgs, rev = cl.deletions_since(ref)
+            out = cl.packets(msgs, MSG_REVS, rev)
+        else:
+            return []
+        g[3] += sum(len(pkt) for pkt in out)
+        return out
+
+    def delete(self, data: bytes, room: int, dev: str, admin: bool, by: str):
+        """T_CHAT_DEL -> packets for everyone in the room, or None. Admins delete anything, others their own."""
+        rid, mid = struct.unpack_from("!HI", data, 1)
+        if rid != room:
+            return None
+        cl = self.room(room)
+        m = cl.get(mid)
+        if m is None or not (admin or (dev and m.get("dev") == dev)):
+            return None
+        if cl.delete(mid, by) is None:
+            return None
+        return cl.packets([m], MSG_LIVE | MSG_REVS)
+# ---- end of chat core ----
 
 
 class _Peer:
@@ -208,7 +580,8 @@ class RoomList:
 
 class RelayServer:
     def __init__(self, port=DEFAULT_PORT, password="", admin_password="", max_clients=15,
-                 bans_path: Path | None = None, bind="0.0.0.0", log=None, rooms_path: Path | None = None):
+                 bans_path: Path | None = None, bind="0.0.0.0", log=None, rooms_path: Path | None = None,
+                 chat_dir: Path | None = None):
         self.port = port
         self.password = password
         self.admin_password = admin_password
@@ -216,6 +589,8 @@ class RelayServer:
         self.bans = BanList(bans_path)
         self.rooms = RoomList(rooms_path)
         self.log = log or (lambda msg: print(f"{_now_text()} {msg}", flush=True))
+        self.chat_dir = chat_dir
+        self.chat = ChatDesk(chat_dir, self.log)
         self.clients: dict[tuple, _Peer] = {}
         self.lock = threading.Lock()
         self.kicked: set[str] = set()
@@ -249,6 +624,7 @@ class RelayServer:
             self.log("WARNING: no room password set; anyone who knows the address can join")
         if not self.admin_password:
             self.log("note: no admin password set; nobody can kick, ban or manage rooms")
+        self.log(f"chat is saved in {self.chat_dir}" if self.chat_dir else "chat is not saved (no chat folder)")
         last_sweep = last_roster = time.monotonic()
         while self.alive:
             data = addr = None
@@ -349,6 +725,48 @@ class RelayServer:
             if c.caps & C_ROOMS:
                 self._send(struct.pack("!BH", T_ROOMS, c.room) + body, addr)
         self._broadcast_statuses(items)
+        self._broadcast_chat_heads(items)
+
+    def _broadcast_chat_heads(self, items):
+        heads: dict[int, bytes] = {}
+        for addr, c in items:
+            if not c.caps & C_CHAT:
+                continue
+            pkt = heads.get(c.room)
+            if pkt is None:
+                deaf = sum(1 for _, p in items if p.room == c.room and not p.caps & C_CHAT)
+                pkt = heads[c.room] = self.chat.room(c.room).head_packet(deaf)
+            self._send(pkt, addr)
+
+    def _chat_room_send(self, room: int, packets):
+        with self.lock:
+            addrs = [a for a, p in self.clients.items() if p.room == room and p.caps & C_CHAT]
+        for pkt in packets:
+            for a in addrs:
+                self._send(pkt, a)
+
+    def _chat(self, t: int, data: bytes, addr, now):
+        with self.lock:
+            c = self.clients.get(addr)
+            if c is not None:
+                c.last = now
+        if c is None or not c.caps & C_CHAT:
+            return
+        who = c.device or f"{addr[0]}:{addr[1]}"
+        if t == T_CHAT_SEND and len(data) >= 9:
+            ack, live = self.chat.send(data, who, c.id, c.name, c.device, c.room, now)
+            if ack is not None:
+                self._send(ack, addr)
+            if live:
+                self._chat_room_send(c.room, live)
+        elif t == T_CHAT_GET and len(data) >= 8:
+            for pkt in self.chat.get(data, who, c.room, now):
+                self._send(pkt, addr)
+        elif t == T_CHAT_DEL and len(data) >= 7:
+            out = self.chat.delete(data, c.room, c.device, c.admin, c.name)
+            if out:
+                self.log(f"chat message deleted in {self._room_name(c.room)} by {c.name}")
+                self._chat_room_send(c.room, out)
 
     def _broadcast_statuses(self, items=None):
         """Everyone's mute/deafen state, to every app that reports its own (so it understands it)."""
@@ -503,6 +921,8 @@ class RelayServer:
                     c.status, c.status_aware, c.last = data[1] & 3, True, now
             if changed:
                 self._broadcast_statuses()
+        elif t in (T_CHAT_SEND, T_CHAT_GET, T_CHAT_DEL):
+            self._chat(t, data, addr, now)
 
     def _hello(self, data: bytes, addr, now):
         if data[1] != PROTOCOL:
@@ -528,7 +948,7 @@ class RelayServer:
         caps, want_room = 0, LOBBY_ID  # 1.1/1.2 apps send zero padding here, or nothing at all
         if len(data) >= off + 3:
             caps, want_room = data[off], struct.unpack_from("!H", data, off + 1)[0]
-        caps &= C_ROOMS | C_SCREEN  # ignore abilities this server doesn't know (newer apps)
+        caps &= C_ROOMS | C_SCREEN | C_CHAT  # ignore abilities this server doesn't know (newer apps)
         ban = self.bans.match(device, ip)
         if ban is not None:
             self._reject(addr, BAN_MSG)
@@ -573,7 +993,7 @@ class RelayServer:
 
     @staticmethod
     def _flags(c: _Peer) -> int:
-        return (F_ADMIN if c.admin else 0) | F_ROOMS | F_SCREEN
+        return (F_ADMIN if c.admin else 0) | F_ROOMS | F_SCREEN | F_CHAT
 
     def _move(self, data: bytes, addr):
         c = self._member(addr)
@@ -722,6 +1142,7 @@ class RelayServer:
                 p.room = LOBBY_ID
             self.sharers.pop(target, None)
             self.rooms.remove(target)
+            self.chat.drop_room(target)  # its log is kept under another name; a new room starts clean
             self.log(f"room deleted by {me.name}: {room['name']} ({len(members)} moved to Lobby)")
             self._broadcast_roster()
             return
@@ -766,6 +1187,7 @@ def init_config(path: Path, port: int) -> dict:
         "max_clients": 15,
         "bans_file": "telsiz_bans.json",
         "rooms_file": "telsiz_rooms.json",
+        "chat_dir": "chat",
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(path, cfg)
@@ -806,6 +1228,8 @@ def main(argv=None):
 
     bans_path = _beside(cfg_path, cfg.get("bans_file", "telsiz_bans.json"))
     rooms_path = _beside(cfg_path, cfg.get("rooms_file", "telsiz_rooms.json"))
+    chat_name = cfg.get("chat_dir", "chat")  # "" or null: chat works but is not saved
+    chat_dir = _beside(cfg_path, str(chat_name)) if chat_name else None
     if args.list_bans or args.unban is not None:
         bans = BanList(bans_path)
         if args.unban is not None:
@@ -829,7 +1253,7 @@ def main(argv=None):
         return 2
     try:
         server = RelayServer(port, password, admin_pw, cfg.get("max_clients", 15), bans_path,
-                             rooms_path=rooms_path)
+                             rooms_path=rooms_path, chat_dir=chat_dir)
     except OSError as e:
         print(f"Could not open UDP port {port}: {e}")
         return 1

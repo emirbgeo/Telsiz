@@ -11,6 +11,8 @@ Run:  python telsiz.py
 Needs: numpy, sounddevice, av, pywebview (the window; it shows ui/index.html)
        optional: pynput for push to talk, pystray + Pillow for the system
        tray icon on Windows, mss + Pillow for screen sharing
+
+Text chat (1.8): one chat per room, kept by the server, or by the PC that hosts.
 """
 from __future__ import annotations
 
@@ -44,7 +46,7 @@ import numpy as np
 
 
 APP_NAME = "Telsiz"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8.1"
 PROTOCOL = 2
 DEFAULT_PORT = 50505
 
@@ -60,8 +62,10 @@ HANG_FRAMES = 15      # voice gate stays open 300 ms after speech drops
 OUT_LATENCY_SAFE = 0.06  # headphone buffer after repeated dropouts (measured: about a third of the dropouts of the minimum)
 PING_EVERY = 1.0
 ROSTER_EVERY = 2.0
-TIMEOUT = 6.0
+TIMEOUT = 15.0        # silence before a connection counts as lost; servers have been seen to stall for 7 s
 JOIN_TIMEOUT = 8.0
+RECONNECT_FOR = 90.0  # after dropping out of a room, keep trying to get back in this long
+LOG_MAX = 256 << 10   # connection.log is cut back to its newer half beyond this size
 SPEAKING_WINDOW = 0.3
 METER_MIN_DB = -80.0
 DEFAULT_DEVICE = "System default"
@@ -104,6 +108,401 @@ def _ustr(buf: bytes, off: int):
     if end > len(buf):
         raise ValueError("truncated string")
     return buf[off + 1:end].decode("utf-8", "replace"), end
+
+
+# ---- chat core: the same code in telsiz.py and server/telsiz_server.py ----
+# Text chat (apps 1.8+, server 1.5+). One chat per room. The server (or the PC
+# that hosts) numbers every message, keeps the last CHAT_KEEP of each room in
+# memory and appends every message to a JSON lines file per room. Apps send a
+# message again until it is acknowledged (the server ignores the copies), and
+# fetch whatever they missed: every ROSTER_EVERY seconds the server tells each
+# app the newest message number of its room.
+T_CHAT_SEND, T_CHAT_MSGS, T_CHAT_ACK, T_CHAT_GET, T_CHAT_HEAD, T_CHAT_DEL = range(21, 27)
+C_CHAT, F_CHAT = 4, 8          # capability bit in the join request, flag in the welcome
+CHAT_MAX_CHARS = 500
+CHAT_MAX_BYTES = 1000          # UTF-8; a message always fits in one packet
+CHAT_MAX_LINES = 15
+CHAT_KEEP = 1000               # messages per room kept in memory and offered as history
+CHAT_JOIN = 100                # sent to someone who arrives; older ones when they ask
+CHAT_PAGE = 50                 # older messages per request
+CHAT_REVS_MAX = 25             # deletions per answer
+CHAT_FILE_MAX = 8 << 20        # a log file this big is archived next to it and a new one started
+CHAT_PACKET = 1300
+CHAT_BURST, CHAT_RATE = 8, 1.0  # messages: 8 in a row, then one a second
+CHAT_GETS_PER_SEC = 10
+CHAT_GET_BYTES = 256_000       # history sent to one person per 10 s at most: a small question can never
+                               # be turned into a flood aimed at someone else's address
+ACK_OK, ACK_SLOW, ACK_BAD, ACK_ROOM = 0, 1, 2, 3
+GET_AFTER, GET_BEFORE, GET_REVS = 0, 1, 2
+MSG_LIVE, MSG_REVS = 1, 2      # T_CHAT_MSGS: just posted (or deleted); carries deletions up to its rev
+M_DELETED = 1                  # per message
+
+# control characters (except newline) and the bidirectional overrides that can make text read backwards
+_CHAT_DROP = dict.fromkeys([*range(0, 9), 11, 12, *range(14, 32), 127, *range(0x80, 0xA0),
+                            *range(0x202A, 0x202F), *range(0x2066, 0x206A)])
+
+
+def clean_chat(text: str) -> str:
+    """What is left of a message after removing what has no business in chat."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", " ").translate(_CHAT_DROP)
+    lines, blank = [], 0
+    for line in text.split("\n"):
+        line = line.rstrip()
+        blank = blank + 1 if not line else 0
+        if blank < 2:                          # at most one empty line in a row
+            lines.append(line)
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    if len(lines) > CHAT_MAX_LINES:            # a wall of short lines: the rest goes on the last line
+        lines = lines[:CHAT_MAX_LINES - 1] + [" ".join(x for x in lines[CHAT_MAX_LINES - 1:] if x)]
+    return "\n".join(lines).strip()
+
+
+def chat_entry(m: dict) -> bytes:
+    tb = m["text"].encode("utf-8")[:CHAT_MAX_BYTES]
+    return (struct.pack("!IIHB", m["id"], m["t"] & 0xFFFFFFFF, m["uid"] & 0xFFFF, m["flags"])
+            + _pstr(m["name"]) + struct.pack("!H", len(tb)) + tb)
+
+
+def parse_chat_msgs(data: bytes):
+    """T_CHAT_MSGS -> (room, epoch, rev, flags, [messages])."""
+    room, epoch, rev, flags, n = struct.unpack_from("!HIIBB", data, 1)
+    off, out = 13, []
+    for _ in range(n):
+        mid, t, uid, mflags = struct.unpack_from("!IIHB", data, off)
+        name, off = _ustr(data, off + 11)
+        (ln,) = struct.unpack_from("!H", data, off)
+        if off + 2 + ln > len(data):
+            raise ValueError("truncated message")
+        text = data[off + 2:off + 2 + ln].decode("utf-8", "replace")
+        off += 2 + ln
+        out.append({"id": mid, "t": t, "uid": uid, "flags": mflags, "name": name, "text": text})
+    return room, epoch, rev, flags, out
+
+
+class ChatLog:
+    """One room's chat: the recent messages in memory, every message appended to a file.
+
+    The file is JSON lines: a header line {"telsiz_chat": 1, "epoch": ...}, then one
+    line per message, and {"del": id} lines for deleted ones. The epoch is a random
+    number that changes when a room's chat starts over (a new room with an old
+    number, a log deleted by hand), so apps know to forget what they had.
+    """
+
+    def __init__(self, path, room: int, log=None):
+        self.path, self.room = path, room
+        self.log = log or (lambda msg: None)
+        self.msgs: collections.deque = collections.deque(maxlen=CHAT_KEEP)
+        self.epoch, self.next_id, self.rev = 0, 1, 0
+        self.revs: collections.deque = collections.deque(maxlen=CHAT_KEEP)  # (rev, id) of deletions
+        self._header_written = False
+        self._warned_at = -1e9
+        self._load()
+        if not self.epoch:
+            self.epoch = secrets.randbits(32) or 1
+
+    # ---- the file ----
+    def _load(self):
+        if self.path is None:
+            return
+        try:
+            f = open(self.path, encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            self.log(f"warning: could not read the chat log {self.path}: {e}")
+            return
+        byid = {}
+        with f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue                    # a line cut short by a crash
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    if "telsiz_chat" in d:
+                        if not self.epoch:
+                            self.epoch = int(d.get("epoch", 0)) & 0xFFFFFFFF
+                            self._header_written = bool(self.epoch)
+                        self.next_id = max(self.next_id, int(d.get("next_id", 1)))
+                        self.rev = max(self.rev, int(d.get("rev", 0)))
+                    elif "del" in d:
+                        self.rev += 1                # every deletion counts, also of messages no longer kept
+                        m = byid.get(int(d["del"]))
+                        if m is not None and not m["flags"] & M_DELETED:
+                            m["flags"] |= M_DELETED
+                            m["text"] = ""
+                            self.revs.append((self.rev, m["id"]))
+                    elif isinstance(d.get("text"), str) and isinstance(d.get("name"), str):
+                        mid = int(d["id"])
+                        if not 0 < mid <= 0xFFFFFFFF:
+                            continue
+                        m = {"id": mid, "t": int(d.get("t", 0)), "uid": int(d.get("uid", 0)) & 0xFFFF,
+                             "name": d["name"][:MAX_NAME], "text": d["text"][:CHAT_MAX_CHARS], "flags": 0,
+                             "dev": str(d.get("dev", ""))[:32]}
+                        if len(self.msgs) == CHAT_KEEP:
+                            byid.pop(self.msgs[0]["id"], None)
+                        self.msgs.append(m)
+                        byid[mid] = m
+                        self.next_id = max(self.next_id, mid + 1)
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+    def _append(self, obj: dict):
+        if self.path is None:
+            return
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            new = not self.path.exists()
+            if new or not self._header_written:
+                line = json.dumps({"telsiz_chat": 1, "room": self.room, "epoch": self.epoch,
+                                   "next_id": self.next_id - (1 if "id" in obj else 0), "rev": self.rev}) + "\n" + line
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line)
+                size = f.tell()
+            if new:
+                try:
+                    os.chmod(self.path, 0o600)      # private conversations
+                except OSError:
+                    pass
+            self._header_written = True
+            if size > CHAT_FILE_MAX:
+                self._rotate()
+        except OSError as e:
+            now = time.monotonic()
+            if now - self._warned_at > 600:
+                self._warned_at = now
+                self.log(f"warning: chat is working, but could not be saved to {self.path}: {e}")
+
+    def _rotate(self):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        os.replace(self.path, self.path.with_name(f"{self.path.stem}.{stamp}{self.path.suffix}"))
+        self._header_written = False   # the next message starts a new file with the same epoch and numbers
+
+    def archive(self, why: str = "deleted"):
+        """The room is gone: keep its log under another name, so a new room with this number starts clean."""
+        if self.path is None or not self.path.exists():
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        try:
+            os.replace(self.path, self.path.with_name(f"{self.path.stem}.{why}-{stamp}{self.path.suffix}"))
+        except OSError as e:
+            self.log(f"warning: could not archive the chat log {self.path}: {e}")
+
+    # ---- messages ----
+    @property
+    def first(self) -> int:
+        return self.msgs[0]["id"] if self.msgs else self.next_id
+
+    @property
+    def last(self) -> int:
+        return self.next_id - 1
+
+    def post(self, uid: int, name: str, text: str, dev: str = "") -> dict:
+        m = {"id": self.next_id, "t": int(time.time()), "uid": uid, "name": name, "text": text,
+             "flags": 0, "dev": dev}
+        self.next_id += 1
+        self.msgs.append(m)
+        self._append({"id": m["id"], "t": m["t"], "uid": uid, "name": name, "text": text, "dev": dev})
+        return m
+
+    def get(self, mid: int):
+        for m in reversed(self.msgs):
+            if m["id"] == mid:
+                return m
+            if m["id"] < mid:
+                break
+        return None
+
+    def delete(self, mid: int, by: str):
+        m = self.get(mid)
+        if m is None or m["flags"] & M_DELETED:
+            return None
+        m["flags"] |= M_DELETED
+        m["text"] = ""
+        self.rev += 1
+        self.revs.append((self.rev, mid))
+        self._append({"del": mid, "by": by, "t": int(time.time())})
+        return m
+
+    def after(self, mid: int, limit: int = CHAT_JOIN) -> list:
+        out = [m for m in self.msgs if m["id"] > mid]
+        return out[-limit:]
+
+    def before(self, mid: int, limit: int = CHAT_PAGE) -> list:
+        return [m for m in self.msgs if m["id"] < mid][-limit:]
+
+    def deletions_since(self, rev: int):
+        """Up to CHAT_REVS_MAX deleted messages after `rev`, and the rev an app is at once it has them."""
+        picked = [(r, i) for r, i in self.revs if r > rev][:CHAT_REVS_MAX]
+        if not picked:
+            return [], self.rev
+        msgs = [m for m in (self.get(i) for _, i in picked) if m is not None]
+        return msgs, (picked[-1][0] if len(picked) == CHAT_REVS_MAX else self.rev)
+
+    # ---- packets ----
+    def head_packet(self, deaf: int) -> bytes:
+        return struct.pack("!BHIIIIB", T_CHAT_HEAD, self.room, self.epoch, self.first, self.last, self.rev,
+                           min(deaf, 255))
+
+    def packets(self, msgs, flags: int = 0, rev=None) -> list:
+        head = struct.pack("!BHIIB", T_CHAT_MSGS, self.room, self.epoch, self.rev if rev is None else rev, flags)
+        out, body, n = [], b"", 0
+        for m in msgs:
+            e = chat_entry(m)
+            if n and (len(head) + 1 + len(body) + len(e) > CHAT_PACKET or n == 255):
+                out.append(head + bytes([n]) + body)
+                body, n = b"", 0
+            body += e
+            n += 1
+        if n or not out:  # an empty answer still says "that is all"
+            out.append(head + bytes([n]) + body)
+        return out
+
+
+class _Bucket:
+    __slots__ = ("level", "at")
+
+    def __init__(self, cap: float, now: float):
+        self.level, self.at = cap, now
+
+    def take(self, cap: float, rate: float, now: float) -> bool:
+        self.level = min(cap, self.level + (now - self.at) * rate)
+        self.at = now
+        if self.level >= 1.0:
+            self.level -= 1.0
+            return True
+        return False
+
+
+class ChatDesk:
+    """The chat of a server or a hosting PC: a ChatLog per room, limits, and the answers to apps.
+
+    The caller decides who may do what (which room someone is in, whether they are
+    an admin) and delivers the packets these methods return.
+    """
+
+    def __init__(self, folder, log=None):
+        self.folder = folder
+        self.log = log or (lambda msg: None)
+        self.logs: dict[int, ChatLog] = {}
+        self._seen: dict[str, collections.OrderedDict] = {}   # who -> message number they chose -> answer
+        self._buckets: dict[str, _Bucket] = {}
+        self._gets: dict[str, list] = {}
+
+    def room(self, rid: int) -> ChatLog:
+        cl = self.logs.get(rid)
+        if cl is None:
+            path = self.folder / f"room-{rid}.jsonl" if self.folder is not None else None
+            cl = self.logs[rid] = ChatLog(path, rid, self.log)
+        return cl
+
+    def drop_room(self, rid: int):
+        self.room(rid).archive()
+        self.logs.pop(rid, None)
+
+    def _tidy(self):
+        for d in (self._seen, self._buckets, self._gets):
+            if len(d) > 4096:
+                d.clear()
+
+    def send(self, data: bytes, who: str, uid: int, name: str, dev: str, room: int, now: float):
+        """T_CHAT_SEND -> (acknowledgement, packets for everyone in the room or None)."""
+        want_room, cid, n = struct.unpack_from("!HIH", data, 1)
+        raw = data[9:9 + n]
+        if len(raw) != n:
+            return None, None
+        self._tidy()
+        seen = self._seen.setdefault(who, collections.OrderedDict())
+        if cid in seen:                         # a copy sent again because our answer got lost
+            r, mid = seen[cid]
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_OK, r, mid), None
+        if want_room != room:
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_ROOM, want_room, 0), None
+        text = clean_chat(raw.decode("utf-8", "replace"))
+        if not text or n > CHAT_MAX_BYTES or len(text) > CHAT_MAX_CHARS:
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_BAD, room, 0), None
+        bucket = self._buckets.get(who)
+        if bucket is None:
+            bucket = self._buckets[who] = _Bucket(CHAT_BURST, now)
+        if not bucket.take(CHAT_BURST, CHAT_RATE, now):
+            return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_SLOW, room, 0), None
+        cl = self.room(room)
+        m = cl.post(uid, name, text, dev)
+        seen[cid] = (room, m["id"])
+        while len(seen) > 64:
+            seen.popitem(last=False)
+        return struct.pack("!BIBHI", T_CHAT_ACK, cid, ACK_OK, room, m["id"]), cl.packets([m], MSG_LIVE)
+
+    def get(self, data: bytes, who: str, room: int, now: float) -> list:
+        """T_CHAT_GET -> the packets that answer it (only about the asker's own room)."""
+        rid, mode, ref = struct.unpack_from("!HBI", data, 1)
+        if rid != room:
+            return []
+        self._tidy()
+        g = self._gets.setdefault(who, [now, 0, now, 0])  # questions this second, bytes these 10 s
+        if now - g[0] >= 1.0:
+            g[0], g[1] = now, 0
+        if now - g[2] >= 10.0:
+            g[2], g[3] = now, 0
+        if g[1] >= CHAT_GETS_PER_SEC or g[3] >= CHAT_GET_BYTES:
+            return []
+        g[1] += 1
+        cl = self.room(room)
+        if mode == GET_AFTER:
+            out = cl.packets(cl.after(ref, CHAT_JOIN))
+        elif mode == GET_BEFORE:
+            out = cl.packets(cl.before(ref, CHAT_PAGE))
+        elif mode == GET_REVS:
+            msgs, rev = cl.deletions_since(ref)
+            out = cl.packets(msgs, MSG_REVS, rev)
+        else:
+            return []
+        g[3] += sum(len(pkt) for pkt in out)
+        return out
+
+    def delete(self, data: bytes, room: int, dev: str, admin: bool, by: str):
+        """T_CHAT_DEL -> packets for everyone in the room, or None. Admins delete anything, others their own."""
+        rid, mid = struct.unpack_from("!HI", data, 1)
+        if rid != room:
+            return None
+        cl = self.room(room)
+        m = cl.get(mid)
+        if m is None or not (admin or (dev and m.get("dev") == dev)):
+            return None
+        if cl.delete(mid, by) is None:
+            return None
+        return cl.packets([m], MSG_LIVE | MSG_REVS)
+# ---- end of chat core ----
+
+
+CHAT_W = 340                 # the chat panel's width; the window grows by this much when it opens
+WINDOW_SIZE, WINDOW_MIN = (440, 820), (380, 560)
+CHAT_GIVE_UP = 20.0          # seconds an unanswered message keeps being sent again
+
+
+class ChatView:
+    """What this app knows about the chat of one room."""
+    __slots__ = ("epoch", "first", "last", "rev", "head_rev", "deaf", "known", "msgs",
+                 "asking", "asked_at", "last_q", "repeat", "older_wanted")
+
+    def __init__(self, epoch: int):
+        self.epoch = epoch
+        self.first = self.last = 0          # the oldest message the server keeps, the newest
+        self.rev = self.head_rev = 0        # deletions we have applied / the server has made
+        self.deaf = 0                       # people in the room whose Telsiz has no chat
+        self.known = False                  # the server has told us where its chat stands
+        self.msgs: dict[int, dict] = {}
+        self.asking = None                  # (mode, ref) of the question on its way
+        self.asked_at = -1e9
+        self.last_q = None                  # the same question again and again (a gap the server can't
+        self.repeat = 0                     # fill, say a log edited by hand) is asked less and less often
+        self.older_wanted = False
 
 
 def lan_ip() -> str:
@@ -791,6 +1190,7 @@ def _chime(freqs, note_ms=70, gap_ms=12, peak=0.16):
 
 CHIME_ON = _chime((784.0, 1046.5))                          # G5 then C6: rising, "you are live"
 CHIME_OFF = _chime((1046.5, 784.0), note_ms=55, peak=0.11)  # falling and softer: "you stopped"
+CHIME_MSG = _chime((1174.7, 1568.0), note_ms=42, gap_ms=6, peak=0.07)  # D6 G6, short and quiet: a message
 
 
 # --------------------------------------------------------------------------
@@ -1074,20 +1474,28 @@ class AudioEngine:
 # Network: host relays, clients connect to the host
 # --------------------------------------------------------------------------
 class _Peer:
-    __slots__ = ("id", "name", "last", "device", "ip", "status", "status_aware")
+    __slots__ = ("id", "name", "last", "device", "ip", "status", "status_aware", "caps")
 
-    def __init__(self, pid, name, last, device="", ip=""):
+    def __init__(self, pid, name, last, device="", ip="", caps=0):
         self.id, self.name, self.last = pid, name, last
         self.device, self.ip = device, ip
         self.status, self.status_aware = 0, False
+        self.caps = caps
 
 
 class HostSession:
     role = "host"
 
-    def __init__(self, engine: AudioEngine, name: str, port: int, password: str = "", bans=None):
+    def __init__(self, engine: AudioEngine, name: str, port: int, password: str = "", bans=None,
+                 chat_dir: Path | None = None, device: str = ""):
         self.engine = engine
         self.name = (name.strip() or "Host")[:MAX_NAME]
+        self.device = device
+        self.is_admin = True                            # the host moderates its own chat
+        self.desk = ChatDesk(chat_dir, lambda msg: print(f"{APP_NAME}: {msg}", file=sys.stderr))
+        self._chat_lock = threading.Lock()
+        self.chat_version = 0
+        self.chat_new = collections.deque(maxlen=50)    # (room, message) from guests, for sounds and unread
         self.port = port
         self.password = password
         self.bans = bans if bans is not None else []  # shared with the app's settings; entries are dicts
@@ -1200,10 +1608,85 @@ class HostSession:
         pkt = self._roster_packet()
         with self.lock:
             addrs = list(self.clients)
+            chat = [a for a, c in self.clients.items() if c.caps & C_CHAT]
+            deaf = len(addrs) - len(chat)
         for a in addrs:
             self._send(pkt, a)
         self._broadcast_statuses()
+        if chat:
+            with self._chat_lock:
+                head = self.desk.room(LOBBY_ID).head_packet(deaf)
+            for a in chat:
+                self._send(head, a)
         self._update_status()
+
+    # ---- chat: the host's PC keeps the room's chat (in the settings folder) ----
+    chat_room = LOBBY_ID
+
+    @property
+    def chat_ready(self) -> bool:
+        return self.alive
+
+    @property
+    def chat_deaf(self) -> int:
+        with self.lock:
+            return sum(1 for c in self.clients.values() if not c.caps & C_CHAT)
+
+    def _chat_guests(self, packets):
+        with self.lock:
+            addrs = [a for a, c in self.clients.items() if c.caps & C_CHAT]
+        for pkt in packets:
+            for a in addrs:
+                self._send(pkt, a)
+
+    def chat_send(self, text: str) -> str:
+        text = clean_chat(text)
+        if not text:
+            return "Type a message first."
+        if len(text) > CHAT_MAX_CHARS or len(text.encode("utf-8")) > CHAT_MAX_BYTES:
+            return f"That message is too long ({CHAT_MAX_CHARS} characters at most)."
+        with self._chat_lock:
+            cl = self.desk.room(LOBBY_ID)
+            m = cl.post(0, self.name, text, self.device)
+            pkts = cl.packets([m], MSG_LIVE)
+            self.chat_version += 1
+        self._chat_guests(pkts)
+        return ""
+
+    def chat_delete(self, mid: int) -> str:
+        with self._chat_lock:
+            cl = self.desk.room(LOBBY_ID)
+            m = cl.delete(int(mid), self.name)
+            pkts = cl.packets([m], MSG_LIVE | MSG_REVS) if m is not None else []
+            self.chat_version += 1
+        self._chat_guests(pkts)
+        return ""
+
+    def chat_older(self):
+        pass  # the host has every kept message already
+
+    def chat_retry(self, cid):
+        pass
+
+    def chat_discard(self, cid):
+        pass
+
+    def chat_take_new(self) -> list:
+        out = []
+        while self.chat_new:
+            out.append(self.chat_new.popleft())
+        return out
+
+    def chat_snapshot(self, limit: int) -> dict:
+        with self._chat_lock:
+            cl = self.desk.room(LOBBY_ID)
+            msgs = list(cl.msgs)
+            shown = msgs[-limit:]
+            out = [{"id": m["id"], "t": m["t"], "name": m["name"], "text": m["text"],
+                    "deleted": bool(m["flags"] & M_DELETED), "mine": bool(self.device) and m.get("dev") == self.device,
+                    "can_delete": not m["flags"] & M_DELETED} for m in shown]
+            return {"key": f"host:{cl.epoch}", "messages": out, "pending": [], "older": len(msgs) > len(shown),
+                    "loading": False}
 
     @property
     def statuses(self) -> dict:
@@ -1321,6 +1804,7 @@ class HostSession:
             pw, off = _ustr(data, off)
             device, off = _ustr(data, off)
             device = device[:32]
+            caps = data[off] if len(data) >= off + 3 else 0  # 1.1/1.2 apps send zero padding here
             with self.lock:
                 known = addr in self.clients
             if not known:
@@ -1347,7 +1831,7 @@ class HostSession:
                         taken = {p.name for p in self.clients.values()} | {self.name}
                         if name in taken:
                             name = f"{name} ({self._next_id})"
-                        c = _Peer(self._next_id, name, now, device, addr[0])
+                        c = _Peer(self._next_id, name, now, device, addr[0], caps & C_CHAT)
                         self._next_id = self._next_id + 1 if self._next_id < 0xFFFE else 1
                         self.clients[addr] = c
                         self._gone.pop(addr, None)
@@ -1360,7 +1844,7 @@ class HostSession:
             if c is None:
                 self._reject(addr, "The room is full.")
                 return
-            self._send(struct.pack("!BH", T_WELCOME, c.id), addr)
+            self._send(struct.pack("!BHB", T_WELCOME, c.id, F_CHAT), addr)  # older apps ignore the flag
             if changed:
                 self._broadcast_roster()
         elif t == T_BYE:
@@ -1378,6 +1862,37 @@ class HostSession:
                     c.status, c.status_aware, c.last = data[1] & 3, True, now
             if changed:
                 self._broadcast_statuses()
+        elif t in (T_CHAT_SEND, T_CHAT_GET, T_CHAT_DEL):
+            self._chat_packet(t, data, addr, now)
+
+    def _chat_packet(self, t, data, addr, now):
+        with self.lock:
+            c = self.clients.get(addr)
+            if c is not None:
+                c.last = now
+        if c is None or not c.caps & C_CHAT:
+            return
+        who = c.device or f"{addr[0]}:{addr[1]}"
+        reply, everyone = [], None
+        with self._chat_lock:
+            if t == T_CHAT_SEND and len(data) >= 9:
+                ack, everyone = self.desk.send(data, who, c.id, c.name, c.device, LOBBY_ID, now)
+                if ack is not None:
+                    reply.append(ack)
+                if everyone:
+                    m = self.desk.room(LOBBY_ID).msgs[-1]
+                    self.chat_new.append((LOBBY_ID, m))
+                    self.chat_version += 1
+            elif t == T_CHAT_GET and len(data) >= 8:
+                reply = self.desk.get(data, who, LOBBY_ID, now)
+            elif t == T_CHAT_DEL and len(data) >= 7:
+                everyone = self.desk.delete(data, LOBBY_ID, c.device, False, c.name)
+                if everyone:
+                    self.chat_version += 1
+        for pkt in reply:
+            self._send(pkt, addr)
+        if everyone:
+            self._chat_guests(everyone)
 
 
 class ClientSession:
@@ -1402,6 +1917,14 @@ class ClientSession:
         self.on_nack = None            # called with (picture, pieces) the server could not resend itself
         self.statuses: dict[int, int] = {}  # mute/deafen state of others (hosts and servers 1.4+)
         self._status_sent, self._status_at = -1, 0.0
+        self.chat_views: dict[int, ChatView] = {}       # room -> what we know of its chat
+        self.chat_pending: collections.OrderedDict = collections.OrderedDict()  # our messages on their way
+        self.chat_mine: set = set()                     # (room, epoch, number) of messages we wrote
+        self.chat_new = collections.deque(maxlen=50)    # (room, message) from others, for sounds and unread
+        self.chat_version = 0
+        self._chat_lock = threading.Lock()
+        self._chat_at = 0.0
+        self._cid = secrets.randbits(32)
         self.addr = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
         self.my_id = None
         self.rtt = None
@@ -1417,6 +1940,8 @@ class ClientSession:
         self.sock.settimeout(0.25)
         self.alive = True
         self._started = self._last_rx = time.monotonic()
+        self.fail_kind = ""            # lost (no packets), noanswer (join), rejected, closed (the room went away)
+        self.silent_for = 0.0          # how long nothing had arrived when it failed
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -1502,13 +2027,22 @@ class ClientSession:
         except OSError:
             pass
 
-    def _fail(self, msg: str):
+    def _fail(self, msg: str, kind: str = "rejected"):
+        self.fail_kind, self.silent_for = kind, time.monotonic() - self._last_rx
         self._shutdown("failed", msg)
+
+    @property
+    def drop_is_temporary(self) -> bool:
+        """A failure worth trying to get back in from: the network, a restarted server, a router that
+        changed our port. Not a kick, a ban, a wrong password or a full room."""
+        if self.fail_kind in ("lost", "noanswer", "closed"):
+            return True
+        return self.fail_kind == "rejected" and "not in this room" in self.status
 
     def _loop(self):
         last_hello = last_ping = 0.0
         hello = bytes([T_HELLO, PROTOCOL]) + _pstr(self.name) + _pstr(self.password) + _pstr(self.device)
-        hello += bytes([C_ROOMS | C_SCREEN]) + struct.pack("!H", self.want_room)  # older hosts ignore this
+        hello += bytes([C_ROOMS | C_SCREEN | C_CHAT]) + struct.pack("!H", self.want_room)  # older hosts ignore this
         hello += bytes(max(0, HELLO_MIN - len(hello)))
         while self.alive:
             now = time.monotonic()
@@ -1517,7 +2051,7 @@ class ClientSession:
                     last_hello = now
                     self._send(hello)
                 if now - self._started > JOIN_TIMEOUT:
-                    self._fail(self._no_answer_message())
+                    self._fail(self._no_answer_message(), "noanswer")
                     break
             elif self.state == "connected":
                 if now - last_ping > PING_EVERY:
@@ -1528,8 +2062,11 @@ class ClientSession:
                     self._status_sent, self._status_at = st, now
                     self._send(bytes([T_STATUS, st]))  # older hosts and servers ignore this
                 if now - self._last_rx > TIMEOUT:
-                    self._fail("Connection to the host was lost.")
+                    self._fail("Connection to the host was lost.", "lost")
                     break
+                if now - self._chat_at >= 0.2:
+                    self._chat_at = now
+                    self._chat_tick(now)
             try:
                 data, addr = self.sock.recvfrom(4096)
             except socket.timeout:
@@ -1549,6 +2086,264 @@ class ClientSession:
                 self._handle(data)
             except (ValueError, IndexError, struct.error):
                 pass
+
+    # ---- chat ----
+    @property
+    def chat_ready(self) -> bool:
+        return self.state == "connected" and bool(self.flags & F_CHAT)
+
+    @property
+    def chat_room(self) -> int:
+        return self.room_id if self.rooms is not None and self.room_id is not None else LOBBY_ID
+
+    @property
+    def chat_deaf(self) -> int:
+        v = self.chat_views.get(self.chat_room)
+        return v.deaf if v is not None else 0
+
+    def chat_send(self, text: str) -> str:
+        text = clean_chat(text)
+        if not text:
+            return "Type a message first."
+        tb = text.encode("utf-8")
+        if len(text) > CHAT_MAX_CHARS or len(tb) > CHAT_MAX_BYTES:
+            return f"That message is too long ({CHAT_MAX_CHARS} characters at most)."
+        if not self.chat_ready:
+            return "Chat isn't available here."
+        now = time.monotonic()
+        with self._chat_lock:
+            if sum(1 for p in self.chat_pending.values() if p["state"] == "sending") >= 20:
+                return "Too many messages are still on their way. Wait a moment."
+            self._cid = (self._cid + 1) & 0xFFFFFFFF
+            cid, room = self._cid, self.chat_room
+            pkt = struct.pack("!BHIH", T_CHAT_SEND, room, cid, len(tb)) + tb
+            self.chat_pending[cid] = {"cid": cid, "room": room, "text": text, "pkt": pkt, "state": "sending",
+                                      "started": None, "first": now, "next": now, "tries": 0, "error": "",
+                                      "id": 0, "slow": False}
+            self.chat_version += 1
+            due = self._chat_due(now)
+        if due is not None:
+            self._send(due)
+        return ""
+
+    def _chat_due(self, now):
+        """The packet to send now, if any. One message is on its way at a time, so a lost packet can
+        never make our messages arrive out of order; the next goes as soon as the last is acknowledged."""
+        for p in self.chat_pending.values():
+            if p["state"] != "sending":
+                continue
+            if p["started"] is None:
+                p["started"], p["next"] = now, now
+            if now - p["started"] > CHAT_GIVE_UP:
+                p["state"], p["error"] = "failed", "No answer from the server."
+                self.chat_version += 1
+                continue                  # the next one may go
+            if now < p["next"]:
+                return None
+            p["tries"] += 1
+            p["next"] = now + min(3.0, 0.4 + 0.4 * p["tries"])
+            return p["pkt"]
+        return None
+
+    def chat_retry(self, cid):
+        now = time.monotonic()
+        with self._chat_lock:
+            p = self.chat_pending.get(int(cid))
+            if p is None or p["state"] != "failed":
+                return
+            tb = p["text"].encode("utf-8")
+            p["room"] = self.chat_room  # the same number: if the first try did arrive, it isn't posted twice
+            p["pkt"] = struct.pack("!BHIH", T_CHAT_SEND, p["room"], p["cid"], len(tb)) + tb
+            p.update(state="sending", started=None, first=now, next=now, tries=0, error="", slow=False)
+            self.chat_pending.move_to_end(p["cid"])  # after whatever was written since
+            self.chat_version += 1
+            due = self._chat_due(now)
+        if due is not None:
+            self._send(due)
+
+    def chat_discard(self, cid):
+        with self._chat_lock:
+            if self.chat_pending.pop(int(cid), None) is not None:
+                self.chat_version += 1
+
+    def chat_delete(self, mid: int) -> str:
+        self._send(struct.pack("!BHI", T_CHAT_DEL, self.chat_room, int(mid) & 0xFFFFFFFF))
+        return ""
+
+    def chat_older(self):
+        with self._chat_lock:
+            v = self.chat_views.get(self.chat_room)
+            if v is not None:
+                v.older_wanted = True
+
+    def chat_take_new(self) -> list:
+        out = []
+        while self.chat_new:
+            out.append(self.chat_new.popleft())
+        return out
+
+    def _is_mine(self, room, epoch, m) -> bool:
+        return (room, epoch, m["id"]) in self.chat_mine or m["name"] == self.name
+
+    def chat_snapshot(self, limit: int) -> dict:
+        with self._chat_lock:
+            room = self.chat_room
+            v = self.chat_views.get(room)
+            ids = sorted(v.msgs) if v is not None else []
+            shown = ids[-limit:]
+            out = []
+            for i in shown:
+                m = v.msgs[i]
+                deleted = bool(m["flags"] & M_DELETED)
+                mine = self._is_mine(room, v.epoch, m)
+                out.append({"id": i, "t": m["t"], "name": m["name"], "text": m["text"], "deleted": deleted,
+                            "mine": mine, "can_delete": not deleted and (mine or self.is_admin)})
+            pend = [{"cid": p["cid"], "text": p["text"], "state": p["state"], "error": p["error"], "slow": p["slow"]}
+                    for p in self.chat_pending.values()
+                    if p["room"] == room and not (p["state"] == "posted" and v is not None and p["id"] in v.msgs)]
+            older = bool(ids) and (len(ids) > len(shown) or ids[0] > v.first)
+            loading = v is None or not v.known or (v.last >= v.first and not ids and v.asking is not None)
+            return {"key": f"{room}:{v.epoch if v is not None else 0}", "messages": out, "pending": pend,
+                    "older": older, "loading": loading}
+
+    def _chat_view(self, room: int, epoch: int) -> ChatView:
+        v = self.chat_views.get(room)
+        if v is None or v.epoch != epoch:  # new, or that room's chat started over
+            v = self.chat_views[room] = ChatView(epoch)
+            self.chat_version += 1
+        return v
+
+    def _chat_tick(self, now):
+        """Send our messages again until they are acknowledged; ask for what we are missing."""
+        if not self.chat_ready:
+            return
+        with self._chat_lock:
+            for p in self.chat_pending.values():
+                if p["state"] == "posted":
+                    v = self.chat_views.get(p["room"])
+                    if (v is not None and p["id"] in v.msgs) or now - p["first"] > 60.0:
+                        p["state"] = "gone"  # the message itself has arrived (or never will)
+            for cid in [c for c, p in self.chat_pending.items() if p["state"] == "gone"]:
+                del self.chat_pending[cid]
+            due = self._chat_due(now)
+            ask = self._chat_question(now)
+        if due is not None:
+            self._send(due)
+        if ask is not None:
+            self._send(ask)
+
+    def _chat_question(self, now):
+        room = self.chat_room
+        v = self.chat_views.get(room)
+        if v is None or not v.known or (v.asking is not None and now - v.asked_at < 1.5):
+            return None  # nothing to go on yet, or waiting for the answer to the last question
+        ids = sorted(v.msgs)
+        q = None
+        if ids and v.rev != v.head_rev:
+            q = (GET_REVS, v.rev)
+        else:
+            start = max(v.first, ids[0]) if ids else max(v.first, v.last - CHAT_JOIN + 1)
+            missing = next((i for i in range(start, v.last + 1) if i not in v.msgs), None)
+            if missing is not None:
+                if v.last - missing >= CHAT_JOIN:   # far behind: start again from the newest
+                    v.msgs.clear()
+                    self.chat_version += 1
+                    q = (GET_AFTER, max(0, v.last - CHAT_JOIN))
+                else:
+                    q = (GET_AFTER, missing - 1)
+            elif v.older_wanted and ids and ids[0] > v.first:
+                q = (GET_BEFORE, ids[0])
+            else:
+                v.older_wanted = False
+        if q is None:
+            v.asking, v.repeat = None, 0
+            return None
+        if q == v.last_q:
+            if now - v.asked_at < min(30.0, 1.5 * 2 ** v.repeat):
+                return None
+            v.repeat += 1
+        else:
+            v.repeat = 0
+        v.last_q, v.asking, v.asked_at = q, q, now
+        return struct.pack("!BHBI", T_CHAT_GET, room, q[0], q[1])
+
+    def _chat_head(self, data: bytes):
+        room, epoch, first, last, rev, deaf = struct.unpack_from("!HIIIIB", data, 1)
+        with self._chat_lock:
+            v = self._chat_view(room, epoch)
+            if (v.first, v.last, v.head_rev, v.deaf, v.known) != (first, last, rev, deaf, True):
+                v.first, v.last, v.head_rev, v.deaf, v.known = first, last, rev, deaf, True
+                self.chat_version += 1
+            if not v.msgs:
+                v.rev = rev  # nothing cached: whatever we fetch comes with its deletions already done
+            ask = self._chat_question(time.monotonic()) if room == self.chat_room else None
+        if ask is not None:
+            self._send(ask)
+
+    def _chat_msgs(self, data: bytes):
+        room, epoch, rev, flags, msgs = parse_chat_msgs(data)
+        due = None
+        with self._chat_lock:
+            v = self._chat_view(room, epoch)
+            live = bool(flags & MSG_LIVE)
+            asked = v.asking
+            if not live:
+                v.asking = None
+                if asked is not None and asked[0] == GET_BEFORE:
+                    v.older_wanted = False
+                    if not msgs and v.msgs:
+                        v.first = min(v.msgs)            # nothing older after all
+            for m in msgs:
+                fresh = m["id"] not in v.msgs
+                v.msgs[m["id"]] = m
+                if m["id"] > v.last:
+                    v.last = m["id"]
+                if live and fresh and not m["flags"] & M_DELETED:
+                    if m["uid"] == self.my_id:
+                        self.chat_mine.add((room, epoch, m["id"]))
+                        for p in self.chat_pending.values():  # it can overtake its acknowledgement
+                            if p["room"] == room and p["state"] == "sending" and p["text"] == m["text"]:
+                                p["state"], p["id"] = "posted", m["id"]
+                                due = self._chat_due(time.monotonic())
+                                break
+                    else:
+                        self.chat_new.append((room, m))
+            if flags & MSG_REVS:
+                if not live or rev == v.rev + 1:
+                    v.rev = max(v.rev, rev) if live else rev
+            while len(v.msgs) > CHAT_KEEP:
+                v.msgs.pop(min(v.msgs))
+            self.chat_version += 1
+        if due is not None:
+            self._send(due)
+
+    def _chat_ack(self, data: bytes):
+        cid, status, room, mid = struct.unpack_from("!IBHI", data, 1)
+        with self._chat_lock:
+            p = self.chat_pending.get(cid)
+            if p is None or p["state"] not in ("sending", "failed"):
+                return
+            due = self._chat_answered(p, status, room, mid)
+        if due is not None:
+            self._send(due)
+
+    def _chat_answered(self, p, status, room, mid):
+        """The server's answer to one of our messages (called with the chat lock held)."""
+        if status == ACK_OK:
+            v = self.chat_views.get(room)
+            self.chat_mine.add((room, v.epoch if v is not None else 0, mid))
+            p["state"], p["id"], p["room"] = "posted", mid, room
+            if v is not None and mid > v.last:
+                v.last = mid                      # the message itself may still be on its way
+        elif status == ACK_SLOW:
+            p["slow"] = True
+            p["next"] = time.monotonic() + 1.2
+        elif status == ACK_ROOM:
+            p["state"], p["error"] = "failed", "Not sent: you changed rooms first."
+        else:
+            p["state"], p["error"] = "failed", "The server didn't take this message."
+        self.chat_version += 1
+        return self._chat_due(time.monotonic())  # the next message goes right away
 
     def _no_answer_message(self) -> str:
         msg = "No answer from the host."
@@ -1595,6 +2390,12 @@ class ClientSession:
             self.rooms_version += 1
         elif t == T_STATUSES:
             self.statuses = _parse_statuses(data)
+        elif t == T_CHAT_MSGS:
+            self._chat_msgs(data)
+        elif t == T_CHAT_HEAD and len(data) >= 20:
+            self._chat_head(data)
+        elif t == T_CHAT_ACK and len(data) >= 12:
+            self._chat_ack(data)
         elif t == T_KEYREQ:
             cb = self.on_keyreq
             if cb is not None:
@@ -1644,7 +2445,7 @@ class ClientSession:
             reason, _ = _ustr(data, 1)
             self._fail(reason)
         elif t == T_BYE:
-            self._fail("The host closed the room.")
+            self._fail("The host closed the room.", "closed")
 
 
 # --------------------------------------------------------------------------
@@ -2036,6 +2837,7 @@ class PushToTalk:
         except Exception:
             self.available = False
         self.key_id = None
+        self.typing_until = 0.0  # while you type in the chat box, a letter key doesn't put you on air
         self._capturing = False
         self._captured = None
         self._lock = threading.Lock()
@@ -2094,6 +2896,8 @@ class PushToTalk:
                 self._captured = ("cancel", "") if kid == "key:esc" else (kid, label)
             return
         if kid is not None and kid == self.key_id and not self.engine.ptt_down:
+            if kid.startswith(("vk:", "char:")) and time.monotonic() < self.typing_until:
+                return                      # a key that types: you are writing a message, not talking
             self.engine.ptt_changed(True)   # held keys auto-repeat; only the first press counts
 
     def _release(self, key):
@@ -2144,6 +2948,8 @@ DEFAULTS = {
     "last_rooms": {},
     "update_check": True,   # ask GitHub once a day whether a newer Telsiz exists
     "update_skip": "",      # a version the user chose to skip
+    "chat_open": False,     # the chat panel was open when Telsiz closed
+    "chat_sound": True,     # a soft sound for messages while you aren't looking at the chat
 }
 
 
@@ -3084,6 +3890,8 @@ class Controller:
         "hide_window", "quit", "first_run_done",
         "viewer_resize", "viewer_fullscreen", "viewer_close",
         "update_check", "update_install", "update_later", "update_skip", "update_auto", "update_page",
+        "chat_log", "chat_send", "chat_delete", "chat_older", "chat_retry", "chat_discard", "chat_view",
+        "set_chat_sound", "open_link",
     )
 
     def __init__(self):
@@ -3132,6 +3940,18 @@ class Controller:
         self._drop_hist = collections.deque(maxlen=11)  # headphone dropout counts, one a second
         self._settled = False
         self.updater = Updater(self)
+        self._chat_open = bool(self.s.get("chat_open"))
+        self._chat_focused = False     # the page says the window has focus (so a message is seen)
+        self._chat_unread = 0
+        self._chat_key = None
+        self._chat_sound_at = 0.0
+        self._chat_grew = None         # "right" or "left" while the window is wider because of the chat
+        self._maximized = False
+        self._hidden = False
+        self._link = 0                 # one per press of Join: stays the same across automatic reconnects
+        self._reconnect = None         # while getting back into a room we dropped out of
+        self._drops = []               # this run's drops: {"at", "why", "back"}
+        self._joined_logged = None
         self._apply_engine_settings()
         self._populate_devices()
         self._start_audio()
@@ -3191,13 +4011,15 @@ class Controller:
                         "capturing": self._capturing},
                 "audio": self._audio_state(),
                 "conn": self._conn_state(sess),
-                "people": self._people_state(sess) if sess is not None else None,
+                "people": (self._people_state(sess) if sess is not None
+                           and not (self._reconnect is not None and sess.state != "connected") else None),
                 "tools": self.form["role"] == "host" or self._admin_session() is not None,
                 "moderate": self._can_moderate(),
                 "bans": len(self._ban_entries()[1]),
                 "watching": ({"uid": self.viewer.uid, "name": self.viewer.name}
                              if self.viewer is not None else None),
                 "update": self.updater.snapshot(),
+                "chat": self._chat_state(sess),
             }
             if self.form["role"] == "host":
                 st["share"] = self._share_info()
@@ -3213,7 +4035,7 @@ class Controller:
             "out": s["speaker"] if s["speaker"] in outs else DEFAULT_DEVICE,
             "in_gain": round(e.in_gain * 100), "out_gain": round(e.out_gain * 100),
             "loopback": bool(e.loopback), "chimes": bool(e.ptt_sounds), "denoise": bool(e.denoise),
-            "error": "\n".join(errs), "check": self._sound_check(),
+            "error": "\n".join(errs), "check": self._sound_check(), "conn_check": self._connection_check(),
         }
 
     def _sound_check(self) -> str:
@@ -3255,6 +4077,11 @@ class Controller:
         if isinstance(sess, HostSession):
             return {"kind": "host", "state": "connected", "port": sess.port, "info": sess.info(),
                     "password": bool(sess.password), "people": len(sess.clients) + 1, "hint": self._rooms_hint()}
+        rc = self._reconnect
+        if rc is not None and sess.state != "connected":
+            return {"kind": "client", "state": "reconnecting", "info": f"Trying for {self._reconnect_age():.0f} s",
+                    "reason": rc["reason"], "where": rc["where"], "admin": False, "rooms": False, "screen": False,
+                    "sharing": False, "pending": False, "room": None, "hint": ""}
         c = {"kind": "client", "state": sess.state, "info": sess.info(), "admin": bool(sess.is_admin),
              "rooms": sess.rooms is not None, "screen": bool(sess.supports_screen),
              "sharing": self.sharer is not None, "pending": self._share_request is not None,
@@ -3408,7 +4235,9 @@ class Controller:
                     port = 0
                 if not 1 <= port <= 65535:
                     raise ValueError("Port must be a number between 1 and 65535.")
-                self.session = HostSession(self.engine, name, port, self.form["host_password"], bans=self.s["bans"])
+                self.session = HostSession(self.engine, name, port, self.form["host_password"], bans=self.s["bans"],
+                                           chat_dir=settings_path().parent / "hosted_chat",
+                                           device=self.s["device_id"])
                 self._fetch_public_ip()
             else:
                 if not self.form["address"].strip():
@@ -3422,6 +4251,8 @@ class Controller:
             return {"error": friendly_error(e)}
         self._seen_notice_version = 0
         self._people_sig = None
+        self._link += 1
+        self._reconnect = None
         self.status = self.session.status
         self._schedule_save()
         return {"ok": True}
@@ -3430,6 +4261,258 @@ class Controller:
         self._end_screens()
         self._people_sig = None
         self._names = {}
+        self._chat_unread = 0
+        self._chat_key = None
+        if self._reconnect is not None:
+            self._log_conn(f"stopped trying to get back in after {self._reconnect_age():.0f} s")
+        self._reconnect = None
+
+    # ---------- dropping out and getting back in ----------
+    def _log_conn(self, text: str):
+        """One line in connection.log next to the settings, so drops leave evidence. No addresses."""
+        p = settings_path().parent / "connection.log"
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if p.exists() and p.stat().st_size > LOG_MAX:
+                keep = p.read_bytes()[-LOG_MAX // 2:]
+                p.write_bytes(keep[keep.find(b"\n") + 1:])
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {text}\n")
+        except OSError:
+            pass
+
+    def _reconnect_age(self) -> float:
+        return time.monotonic() - self._reconnect["since"] if self._reconnect else 0.0
+
+    def _session_failed(self, sess):
+        """The session ended by itself. Try to get back in when the cause can pass; otherwise say why."""
+        now = time.monotonic()
+        rc = self._reconnect
+        temporary = isinstance(sess, ClientSession) and sess.drop_is_temporary
+        if temporary and rc is None and sess.connected_at is not None:  # just dropped out of a room
+            lasted = now - sess.connected_at
+            where = self._chat_where(sess)
+            ping = f", ping was {sess.rtt:.0f} ms" if sess.rtt is not None else ""
+            heard = (f"nothing had arrived for {sess.silent_for:.1f} s" if sess.fail_kind == "lost" else
+                     f"the last packet had arrived {sess.silent_for:.1f} s before")
+            self._log_conn(f"dropped out of {where} after {int(lasted // 60)} min {int(lasted % 60):02d} s: "
+                           f"{sess.status} ({heard}{ping})")
+            rc = self._reconnect = {"since": now, "reason": sess.status, "where": where, "attempts": 0,
+                                    "room": sess.room_id if sess.rooms is not None else None, "next": now,
+                                    "old": sess}
+            self._drops.append({"at": time.strftime("%H:%M"), "why": sess.status, "back": None})
+        if temporary and rc is not None and now - rc["since"] < RECONNECT_FOR:
+            if now < rc["next"]:
+                return  # the last try failed fast (no network at all): a short pause first
+            rc["attempts"] += 1
+            rc["next"] = now + 2.0
+            try:
+                new = self._rejoin(rc)
+            except Exception as e:
+                if rc["attempts"] == 1 or rc["attempts"] % 10 == 0:
+                    self._log_conn(f"try {rc['attempts']} to get back in failed at once: {friendly_error(e)}")
+                return
+            self._end_screens()          # a share or a watched screen belonged to the old connection
+            self._people_sig = None
+            self._names = {}
+            self._seen_notice_version = 0
+            self.session = new
+            self.status = f"Reconnecting… ({rc['reason']})"
+            return
+        if rc is not None:
+            age = now - rc["since"]
+            last = "no answer" if getattr(sess, "fail_kind", "") == "noanswer" else sess.status
+            self._log_conn(f"could not get back in after {age:.0f} s ({rc['attempts']} tries): {last}")
+            msg = (f"{rc['reason']} Telsiz tried to get back in for {age:.0f} s"
+                   + (f" ({last.rstrip('.')})" if last != rc["reason"] else "") + ". Press Join to try again.")
+        else:
+            msg = sess.status
+            if isinstance(sess, ClientSession) and sess.connected_at is not None:
+                self._log_conn(f"left {self._chat_where(sess)}: {sess.status}")
+        self._reconnect = None
+        self.session = None
+        self._session_ended()
+        self.status = msg
+
+    def _rejoin(self, rc):
+        """A new connection to the same room, carrying over the chat messages still on their way."""
+        old = rc["old"]
+        host, port = parse_address(self.form["address"])
+        want = rc["room"] or int(self.s["last_rooms"].get(self._room_key(), LOBBY_ID))
+        new = ClientSession(self.engine, self.s["name"].strip() or "Player", host, port, self.form["join_password"],
+                            device=self.s["device_id"], want_room=want)
+        with old._chat_lock:
+            new._cid = old._cid           # the same numbers: the server ignores a message it already has
+            new.chat_mine = set(old.chat_mine)
+            for cid, p in old.chat_pending.items():
+                if p["state"] in ("sending", "failed") or (p["state"] == "posted" and p["room"] == want):
+                    q = dict(p, started=None, next=0.0, tries=0)
+                    if q["state"] == "failed" and q["error"] == "No answer from the server.":
+                        q.update(state="sending", error="")
+                    new.chat_pending[cid] = q
+        rc["old"] = new
+        return new
+
+    def _connection_check(self) -> str:
+        """One line for Audio settings about drops since Telsiz started."""
+        if not self._drops:
+            return "No dropped connections since Telsiz started."
+        d = self._drops[-1]
+        n = len(self._drops)
+        text = ("1 dropped connection" if n == 1 else f"{n} dropped connections") + " since Telsiz started."
+        text += f" The last at {d['at']}: {d['why']}"
+        text += f" Back in after {d['back']:.0f} s." if d["back"] is not None else ""
+        return text + " Details: connection.log in the settings folder."
+
+    # ---------- chat ----------
+    def _chat_where(self, sess) -> str:
+        if isinstance(sess, HostSession):
+            return "Your room"
+        r = sess.my_room() if sess.rooms is not None else None
+        if r is not None:
+            return r["name"]
+        host = next((nm for uid, nm in sess.roster() if uid == 0), "")
+        return f"{host}'s room" if host else "This room"
+
+    def _chat_state(self, sess):
+        st = {"ok": False, "why": "", "where": "", "note": "", "open": self._chat_open,
+              "unread": self._chat_unread, "sound": bool(self.s.get("chat_sound", True)), "version": "none"}
+        if sess is None:
+            st["why"] = "Host a room or join one, and its chat shows up here."
+            return st
+        if isinstance(sess, ClientSession) and sess.state != "connected":
+            st["why"] = ("Reconnecting… Messages that were still on their way go out when you are back."
+                         if self._reconnect is not None else "Connecting…")
+            st["version"] = f"{id(sess)}:c"
+            return st
+        if not sess.chat_ready:
+            st["why"] = ("This room has no chat: it runs an older Telsiz. Chat needs a Telsiz server 1.5 or newer, "
+                         "or a host on Telsiz 1.8 or newer.")
+            st["version"] = f"{id(sess)}:x"
+            return st
+        st["ok"], st["where"] = True, self._chat_where(sess)
+        deaf = sess.chat_deaf
+        if deaf == 1:
+            st["note"] = "1 person here has an older Telsiz and doesn't see the chat."
+        elif deaf:
+            st["note"] = f"{deaf} people here have an older Telsiz and don't see the chat."
+        st["version"] = f"{id(sess)}:{sess.chat_room}:{sess.chat_version}"
+        return st
+
+    def _sync_chat(self, sess):
+        """Unread count and the message sound, for messages from others in the room we are in."""
+        if not hasattr(sess, "chat_take_new"):
+            return
+        key = (self._link, sess.chat_room)
+        if key != self._chat_key:  # another room: its chat starts read
+            self._chat_key, self._chat_unread = key, 0
+        new = [m for room, m in sess.chat_take_new() if room == sess.chat_room]
+        if not new:
+            return
+        if not self._chat_open:
+            self._chat_unread = min(999, self._chat_unread + len(new))
+        looking = self._chat_open and self._chat_focused and not self._hidden
+        now = time.monotonic()
+        if not looking and self.s.get("chat_sound", True) and now - self._chat_sound_at > 1.5:
+            self._chat_sound_at = now      # a burst of messages: one sound
+            self.engine.play_fx(CHIME_MSG)
+
+    def _chat_sess(self):
+        sess = self.session
+        if sess is None or not sess.chat_ready:
+            raise ValueError("Chat isn't available right now.")
+        return sess
+
+    def chat_log(self, limit=200):
+        sess = self.session
+        if sess is None or not sess.chat_ready:
+            return {"key": "none", "messages": [], "pending": [], "older": False, "loading": False, "me": ""}
+        try:
+            limit = max(20, min(CHAT_KEEP, int(limit)))
+        except (TypeError, ValueError):
+            limit = 200
+        snap = sess.chat_snapshot(limit)
+        snap["me"] = sess.name
+        return snap
+
+    def chat_send(self, text):
+        if not isinstance(text, str):
+            return {"error": "Bad request."}
+        err = self._chat_sess().chat_send(text[:4 * CHAT_MAX_CHARS])
+        return {"error": err} if err else {"ok": True}
+
+    def chat_delete(self, mid):
+        self._chat_sess().chat_delete(int(mid))
+        return {"ok": True}
+
+    def chat_older(self):
+        self._chat_sess().chat_older()
+        return {"ok": True}
+
+    def chat_retry(self, cid):
+        self._chat_sess().chat_retry(int(cid))
+        return {"ok": True}
+
+    def chat_discard(self, cid):
+        self._chat_sess().chat_discard(int(cid))
+        return {"ok": True}
+
+    def chat_view(self, open=None, focused=None, typing=None, grow=""):
+        """What the page reports: the panel opened or closed, the window got or lost focus, typing in the box."""
+        if open is not None:
+            o = bool(open)
+            if o != self._chat_open:
+                self._chat_open = o
+                self.s["chat_open"] = o
+                self._schedule_save()
+                self._chat_window(o, grow if grow in ("right", "left") else "")
+            if o:
+                self._chat_unread = 0
+        if focused is not None:
+            self._chat_focused = bool(focused)
+        if typing is not None:
+            self.ptt.typing_until = time.monotonic() + 2.5 if typing else 0.0
+        return {"ok": True}
+
+    def _chat_window(self, open_, side):
+        """Widen the window for the chat (toward the side with room on the screen); narrow it back after."""
+        w = self.window
+        if w is None or self.webview is None or self.browser_mode:
+            return
+        if open_:
+            if not side or self._maximized or self._chat_grew:
+                return
+            self._chat_grew = side
+        else:
+            side, self._chat_grew = self._chat_grew, None
+            if not side or self._maximized:
+                return
+
+        def work():
+            try:
+                from webview.window import FixPoint  # keep the left edge, or the right one when growing left
+                fix = FixPoint.NORTH | (FixPoint.EAST if side == "left" else FixPoint.WEST)
+                cw, ch = int(w.width), int(w.height)
+                w.resize(cw + CHAT_W if open_ else max(WINDOW_MIN[0], cw - CHAT_W), ch, fix)
+            except Exception:
+                pass
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_chat_sound(self, on):
+        self.s["chat_sound"] = bool(on)
+        self._schedule_save()
+        return {"ok": True}
+
+    def open_link(self, url):
+        """A link in a chat message: only web addresses, opened in the default browser, never in Telsiz."""
+        if not isinstance(url, str) or len(url) > 2048:
+            return {"error": "That link can't be opened."}
+        u = urllib.parse.urlsplit(url.strip())
+        if u.scheme.lower() not in ("http", "https") or not u.netloc or any(c in url for c in "\r\n\t "):
+            return {"error": "Only web links (http and https) can be opened."}
+        import webbrowser
+        threading.Thread(target=_quietly(webbrowser.open, u.geturl()), daemon=True).start()
+        return {"ok": True}
 
     # ---------- people, rooms, moderation ----------
     def _sync_people(self, sess):
@@ -3855,11 +4938,26 @@ class Controller:
         sess = self.session
         if sess is not None:
             if sess.state == "failed":
-                msg = sess.status
-                self.session = None
-                self._session_ended()
-                self.status = msg
+                self._session_failed(sess)
+            elif self._reconnect is not None and sess.state != "connected":
+                self.status = f"Reconnecting… {self._reconnect_age():.0f} s"
             else:
+                if self._reconnect is not None:  # back in
+                    age = self._reconnect_age()
+                    where = self._chat_where(sess)
+                    if where == "This room":          # the room list is still on its way: we asked for the same room
+                        where = self._reconnect["where"]
+                    self._log_conn(f"back in {where} after {age:.1f} s "
+                                   f"({self._reconnect['attempts']} {'try' if self._reconnect['attempts'] == 1 else 'tries'})")
+                    if self._drops:
+                        self._drops[-1]["back"] = age
+                    self._reconnect = None
+                    self._show_notice(f"Reconnected after {age:.0f} s.", 4.0)
+                    self._joined_logged = sess
+                elif (self._joined_logged is not sess and isinstance(sess, ClientSession) and sess.state == "connected"
+                      and (sess.rooms is not None or time.monotonic() - (sess.connected_at or 0.0) > 1.0)):
+                    self._joined_logged = sess   # once the room is known, so the log names it
+                    self._log_conn(f"joined {self._chat_where(sess)}")
                 nv = getattr(sess, "notice_version", 0)
                 if nv != self._seen_notice_version:
                     self._seen_notice_version = nv
@@ -3874,6 +4972,7 @@ class Controller:
                     self.status = sess.status
                 self._sync_people(sess)
                 self._sync_screens(sess)
+                self._sync_chat(sess)
         cap = self.ptt.take_captured()
         if cap is not None:
             if cap[0] != "cancel":
@@ -3996,6 +5095,8 @@ class Controller:
                 webbrowser.open(self.server.url())
             return
 
+        self._hidden = False
+
         def work():
             try:
                 w.show()
@@ -4011,6 +5112,7 @@ class Controller:
         if not self.tray.available or self.window is None:
             return {"ok": False}
         threading.Thread(target=_quietly(self.window.hide), daemon=True).start()
+        self._hidden = True
         if not self.s.get("tray_hint_shown"):
             self.s["tray_hint_shown"] = True
             self._schedule_save()
@@ -4168,10 +5270,24 @@ def main():
         _browser_mode(ctl, f"pywebview could not load ({e})")
         return
     ctl.webview = webview
+    width = WINDOW_SIZE[0] + (CHAT_W if ctl._chat_open else 0)  # the chat was open last time: room for it
+    if ctl._chat_open:
+        ctl._chat_grew = "right"
     ctl.window = webview.create_window(f"{APP_NAME} {APP_VERSION}", ctl.server.url("index.html"),
-                                       width=440, height=820, min_size=(380, 560),
+                                       width=width, height=WINDOW_SIZE[1], min_size=WINDOW_MIN,
                                        background_color="#0E1830")
     ctl.window.events.closing += ctl.on_closing
+
+    def _maximized(*_):
+        ctl._maximized = True
+
+    def _restored(*_):
+        ctl._maximized = False
+    try:
+        ctl.window.events.maximized += _maximized
+        ctl.window.events.restored += _restored
+    except Exception:
+        pass
     if os.environ.get("TELSIZ_PRINT_URL"):  # debugging aid: lets a browser or script talk to the window's API
         print(ctl.server.url(), flush=True)
     icon_path = None

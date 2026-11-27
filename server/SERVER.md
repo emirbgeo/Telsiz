@@ -57,7 +57,8 @@ Once everyone is on the server, **delete the UDP 50505 forwarding rule on your r
 | Change a password | `sudo nano /var/lib/telsiz/server.json`, then `sudo systemctl restart telsiz` |
 | List bans | `sudo runuser -u telsiz -- python3 /opt/telsiz/telsiz_server.py --config /var/lib/telsiz/server.json --list-bans` |
 | Remove ban number 3 | same command with `--unban 3` instead of `--list-bans` (works while the room runs) |
-| Update Telsiz server | see "Updating" below; passwords, bans and rooms stay |
+| Update Telsiz server | see "Updating" below; passwords, bans, rooms and chat stay |
+| Read a room's chat log | `sudo tail -n 50 /var/lib/telsiz/chat/room-1.jsonl` (room 1 is the Lobby) |
 | Keep the system patched | `sudo apt update && sudo apt upgrade` about once a month |
 | Remove everything | `sudo systemctl disable --now telsiz`, then `sudo rm -rf /opt/telsiz /var/lib/telsiz /etc/systemd/system/telsiz.service` and `sudo userdel telsiz` |
 
@@ -84,7 +85,7 @@ ssh root@SERVER_IP "sh /root/telsiz-server/install_server.sh"
 
 The first line matters: when the folder already exists, `scp -r` puts the new copy inside it as `server` instead of replacing it, and the old installer would reinstall the old version. (Installers from 1.4 on notice this and use the inner copy.)
 
-Either way the installer ends with the version now running, for example `Telsiz server 1.4 is running.` Only the download or upload folder is replaced: your passwords, bans and rooms live in `/var/lib/telsiz` and stay. Never delete `/var/lib/telsiz` unless you want to start over with new passwords.
+Either way the installer ends with the version now running, for example `Telsiz server 1.5 is running.` Only the download or upload folder is replaced: your passwords, bans, rooms and chat logs live in `/var/lib/telsiz` and stay. Never delete `/var/lib/telsiz` unless you want to start over with new passwords.
 
 ## How the room behaves
 
@@ -93,6 +94,17 @@ Either way the installer ends with the version now running, for example `Telsiz 
 * Admins can't kick or ban each other.
 * After 10 wrong passwords from one address within a minute, that address is ignored for the rest of the minute, so passwords can't be guessed quickly. Replies to strangers are rate limited, so the server can't be used to flood anyone.
 * Friends still on Telsiz 1.1 can join and talk. Only the admin needs 1.2 for Kick and Ban.
+
+## Text chat (server 1.5)
+
+* Every room has its own chat. Apps 1.8 and newer show it; older apps keep talking as before and don't see it. Server 1.5 needs nothing new: an existing `server.json` works as it is.
+* Each room's messages are appended to `/var/lib/telsiz/chat/room-<number>.jsonl`, one JSON object per line: a header line, then `{"id", "t" (Unix time), "uid", "name", "text", "dev"}` per message, and `{"del": id, "by": name}` when someone deletes one. The folder is readable only by the `telsiz` user; read it with `sudo`. `dev` is the sender's device ID, the same one bans use; apps are never sent it.
+* The server keeps the last 1000 messages of each room in memory and gives newcomers the newest 100 (older ones on request). A log that grows past 8 MB is renamed with the date and a new one starts, so nothing is ever thrown away. Deleting a room renames its log to `room-<number>.deleted-<date>.jsonl`, and a new room that later gets the same number starts with an empty chat.
+* **Deleted messages** disappear from everyone's screen, but their text stays in the log, so you can still see what was said. To remove text for good, stop the server (`sudo systemctl stop telsiz`), edit or delete the file, and start it again.
+* **Clear a room's chat:** stop the server, delete that room's file, start the server.
+* **Don't save chat at all:** set `"chat_dir": ""` in `server.json` and restart. Chat still works, but only in memory, and it is gone after a restart.
+* **Limits:** a message is at most 500 characters; a person can send 8 messages in a row and then one a second (the app holds the rest and sends them in time, so nothing is lost); the history one person can request is capped, so the server can't be used to flood anyone.
+* **Privacy:** chat is not encrypted on the way, and whoever can log in to the server can read every log. Tell your friends.
 
 ## Mute and deafen marks (server 1.4)
 
@@ -108,7 +120,7 @@ Either way the installer ends with the version now running, for example `Telsiz 
 
 ## Bandwidth
 
-Each person talking costs about 45 kbit/s for every listener. The server sends that to everyone else, so 6 people with one or two talking at a time is roughly 0.2 to 0.5 Mbit/s. Three hours every evening for a month is around 15 GB, a few percent of the smallest plans above.
+Each person talking costs about 50 to 55 kbit/s for every listener (with apps 1.7 and newer). The server sends that to everyone else, so 6 people with one or two talking at a time is roughly 0.2 to 0.5 Mbit/s. Three hours every evening for a month is around 15 GB, a few percent of the smallest plans above.
 
 Screen sharing costs at most 1.5 Mbit/s per viewer (measured 1.0 to 1.45 Mbit/s for a busy screen). Five people watching is at most 7.5 Mbit/s, about 3.4 GB per hour. A 1 TB plan therefore covers roughly 290 hours of five-viewer sharing a month on top of voice, and a 1 Gbit/s port is never the limit. Relaying it used 0.5% of one CPU core in testing.
 
@@ -116,3 +128,4 @@ Screen sharing costs at most 1.5 Mbit/s per viewer (measured 1.0 to 1.45 Mbit/s 
 
 * No encryption, same as PC hosting. That includes the admin password, which crosses the internet each time you join. Don't join as admin from public Wi Fi.
 * Up to 50 people per server (`max_clients` in the settings file; 15 by default).
+* Chat logs grow by roughly 150 bytes per message: a busy evening of a thousand messages is about 150 KB.
